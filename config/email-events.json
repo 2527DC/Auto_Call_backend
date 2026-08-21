@@ -1,0 +1,79 @@
+{
+  "welcome-message": {
+    "name": "Welcome Message",
+    "description": "Sent to a user immediately after they register.",
+    "slug": "welcome-message",
+    "shortcodes": [
+      { "type": "variable", "text": "User Name", "action": "{{user_name}}" },
+      { "type": "variable", "text": "User Email", "action": "{{user_email}}" },
+      { "type": "variable", "text": "Application Name", "action": "{{app_name}}" },
+      { "type": "variable", "text": "Login URL", "action": "{{login_url}}" }
+    ],
+    "default_subject": "Welcome to {{app_name}}!",
+    "default_content": "<p>Hello {{user_name}},</p><p>Welcome to {{app_name}}! We are thrilled to have you.</p><p>You can login here: <a href=\"{{login_url}}\">Login</a></p>"
+  },
+  "password-reset-otp": {
+    "name": "Password Reset OTP",
+    "description": "Sent when a user requests to reset their password.",
+    "slug": "password-reset-otp",
+    "shortcodes": [
+      { "type": "variable", "text": "User Name", "action": "{{user_name}}" },
+      { "type": "variable", "text": "Reset URL", "action": "{{reset_url}}" },
+      { "type": "variable", "text": "OTP Code", "action": "{{otp_code}}" },
+      { "type": "variable", "text": "Application Name", "action": "{{app_name}}" }
+    ],
+    "default_subject": "Password Reset OTP - {{app_name}}",
+    "default_content": "<p>Hello {{user_name}},</p><p>Your OTP code to reset your password is: <strong>{{otp_code}}</strong></p><p>If you did not request this, please ignore this email.</p>"
+  },
+  "password-reset-success": {
+    "name": "Password Reset Success",
+    "description": "Sent when a user successfully resets their password.",
+    "slug": "password-reset-success",
+    "shortcodes": [
+      { "type": "variable", "text": "User Name", "action": "{{user_name}}" },
+      { "type": "variable", "text": "Application Name", "action": "{{app_name}}" }
+    ],
+    "default_subject": "Password Changed Successfully - {{app_name}}",
+    "default_content": "<p>Hello {{user_name}},</p><p>Your password has been successfully reset. If you did not make this change, please contact support immediately.</p>"
+  },
+  "registration-otp": {
+    "name": "Registration OTP",
+    "description": "Sent when a user starts registration to verify their email.",
+    "slug": "registration-otp",
+    "shortcodes": [
+      { "type": "variable", "text": "User Name", "action": "{{user_name}}" },
+      { "type": "variable", "text": "OTP Code", "action": "{{otp_code}}" },
+      { "type": "variable", "text": "Application Name", "action": "{{app_name}}" }
+    ],
+    "default_subject": "Registration OTP - {{app_name}}",
+    "default_content": "<p>Hello {{user_name}},</p><p>Your OTP code to verify your email for registration is: <strong>{{otp_code}}</strong></p><p>If you did not request this, please ignore this email.</p>"
+  },
+  "team-member-created": {
+    "name": "Team Member Created",
+    "description": "Sent to a new team member with their login credentials.",
+    "slug": "team-member-created",
+    "shortcodes": [
+      { "type": "variable", "text": "User Name", "action": "{{user_name}}" },
+      { "type": "variable", "text": "Login Email", "action": "{{login_email}}" },
+      { "type": "variable", "text": "Login Password", "action": "{{login_password}}" },
+      { "type": "variable", "text": "Login URL", "action": "{{login_url}}" },
+      { "type": "variable", "text": "Application Name", "action": "{{app_name}}" }
+    ],
+    "default_subject": "You have been added to a team on {{app_name}}",
+    "default_content": "<p>Hello {{user_name}},</p><p>You have been added as a team member on {{app_name}}.</p><p>Your login credentials are:</p><p><strong>Email:</strong> {{login_email}}</p><p><strong>Password:</strong> {{login_password}}</p><p>You can login here: <a href=\"{{login_url}}\">Login</a></p><p>Please change your password after logging in.</p>"
+  },
+  "violence-warning": {
+    "name": "Policy Breach Warning",
+    "description": "Sent to a contact when they are flagged for using inappropriate language.",
+    "slug": "violence-warning",
+    "shortcodes": [
+      { "type": "variable", "text": "Contact First Name", "action": "{{contact.first_name}}" },
+      { "type": "variable", "text": "Contact Last Name", "action": "{{contact.last_name}}" },
+      { "type": "variable", "text": "Contact Phone Number", "action": "{{contact.phone_number}}" },
+      { "type": "variable", "text": "Breach Words", "action": "{{breach.words}}" },
+      { "type": "variable", "text": "Transcript Snippet", "action": "{{breach.transcript}}" }
+    ],
+    "default_subject": "Important Notice: Policy Breach Detected",
+    "default_content": "<p>Hello {{contact.first_name}},</p><p>This is an automated notice regarding a recent interaction.</p><p>We detected the use of inappropriate language that breaches our communication policies.</p><p><strong>Breach Words:</strong> {{breach.words}}</p><p><strong>Context:</strong> \"{{breach.transcript}}\"</p><p>Please ensure all future communications adhere to our guidelines, as repeated violations may result in a permanent block.</p>"
+  }
+}

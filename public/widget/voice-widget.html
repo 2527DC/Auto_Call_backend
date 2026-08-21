@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Voice Chat</title>
+    <style>
+        body {
+            margin: 0;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: #fff;
+            overflow: hidden;
+        }
+
+        .widget-container {
+            width: 100%;
+            height: 500px;
+            display: flex;
+            flex-direction: column;
+            border-radius: 12px;
+            box-sizing: border-box;
+            background-color: #f9fafb;
+        }
+
+        .header {
+            padding: 15px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #e5e7eb;
+            background-color: #fff;
+        }
+
+        .header-title {
+            font-weight: 600;
+            font-size: 16px;
+            color: #111827;
+        }
+
+        .close-btn {
+            cursor: pointer;
+            padding: 5px;
+            color: #6b7280;
+        }
+
+        .content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            text-align: center;
+        }
+
+
+        /* Voice Screen */
+        .voice-screen {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            width: 100%;
+        }
+
+        .visualizer {
+            width: 120px;
+            height: 120px;
+            background-color: #3b82f6;
+            border-radius: 50%;
+            margin-bottom: 40px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+        }
+
+        .visualizer::after {
+            content: '';
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            background-color: #3b82f6;
+            opacity: 0.3;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% {
+                transform: scale(1);
+                opacity: 0.4;
+            }
+
+            100% {
+                transform: scale(1.6);
+                opacity: 0;
+            }
+        }
+
+        .status-text {
+            font-size: 14px;
+            color: #6b7280;
+            margin-bottom: 8px;
+        }
+
+        .timer {
+            font-size: 24px;
+            font-weight: 700;
+            color: #111827;
+            margin-bottom: 40px;
+        }
+
+        .controls {
+            display: flex;
+            gap: 20px;
+        }
+
+        .control-btn {
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            border: none;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        }
+
+        .btn-hangup {
+            background-color: #ef4444;
+            color: #fff;
+        }
+
+        .btn-mute {
+            background-color: #fff;
+            color: #6b7280;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="widget-container">
+        <div class="header">
+            <div class="header-title" id="brand-name">AI Assistant</div>
+            <div class="close-btn" onclick="closeWidget()">
+                <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                    <path d="M6 18L18 6M6 6l12 12"></path>
+                </svg>
+            </div>
+        </div>
+
+        <div class="content">
+
+
+            <!-- Voice Screen -->
+            <div id="voice-screen" class="voice-screen">
+                <div class="status-text" id="call-status">Connecting...</div>
+                <div class="visualizer">
+                    <svg width="40" height="40" fill="white" viewBox="0 0 24 24">
+                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                        <line x1="12" y1="19" x2="12" y2="23"></line>
+                        <line x1="8" y1="23" x2="16" y2="23"></line>
+                    </svg>
+                </div>
+                <div class="timer" id="call-timer">00:00</div>
+
+                <div class="controls">
+                    <button class="control-btn btn-mute" onclick="toggleMute()">
+                        <svg width="24" height="24" fill="none" stroke="currentColor" stroke-width="2"
+                            viewBox="0 0 24 24">
+                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                            <line x1="12" y1="19" x2="12" y2="23"></line>
+                            <line x1="8" y1="23" x2="16" y2="23"></line>
+                        </svg>
+                    </button>
+                    <button class="control-btn btn-hangup" onclick="endCall()">
+                        <svg width="24" height="24" fill="none" stroke="white" stroke-width="2" viewBox="0 0 24 24">
+                            <path
+                                d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7 2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91">
+                            </path>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/@twilio/voice-sdk@2.1.1/dist/twilio.min.js"></script>
+    <script>
+        const urlParams = new URLSearchParams(window.location.search);
+        const widgetKey = urlParams.get('key');
+        let widgetData = null;
+        let timerInterval = null;
+        let seconds = 0;
+        let device = null;
+        let activeCall = null;
+
+        fetch('/api/widgets/public/' + widgetKey)
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    widgetData = data.data;
+                    setupBranding();
+                    startCall();
+                }
+            });
+
+        function setupBranding() {
+            document.getElementById('brand-name').textContent = widgetData.branding.brand_name;
+            const primaryColor = widgetData.branding.primary_color;
+            document.querySelectorAll('.btn-primary').forEach(el => el.style.backgroundColor = primaryColor);
+            document.querySelector('.visualizer').style.backgroundColor = primaryColor;
+            document.querySelector('.visualizer').style.setProperty('--pulse-color', primaryColor);
+        }
+
+        function showScreen(screenId) {
+            document.getElementById('voice-screen').style.display = 'none';
+            document.getElementById(screenId).style.display = 'flex';
+        }
+
+
+
+        async function startCall() {
+            showScreen('voice-screen');
+            document.getElementById('call-status').textContent = 'Connecting...';
+
+            try {
+                const response = await fetch('/api/widgets/token/' + widgetKey + '?t=' + Date.now());
+                const data = await response.json();
+
+                if (!data.success) throw new Error(data.message);
+
+                device = new Twilio.Device(data.token, {
+                    codecPreferences: ['opus', 'pcmu'],
+                    fakeLocalAudio: true,
+                    enableIceRestart: true,
+                });
+
+                device.on('registered', () => {
+                    console.log('Twilio Device Registered');
+                    makeCall();
+                });
+
+                device.on('error', (error) => {
+                    console.error('Twilio Device Error:', error);
+                    let errMsg = 'Connection Error: ' + JSON.stringify(error) + ' | ' + error.message;
+                    document.getElementById('call-status').textContent = errMsg;
+                });
+
+                device.register();
+            } catch (err) {
+                console.error('Failed to start call:', err);
+                document.getElementById('call-status').textContent = 'Failed to connect';
+            }
+        }
+
+        async function makeCall() {
+            const params = { widgetKey: widgetKey };
+            activeCall = await device.connect({ params });
+
+            activeCall.on('accept', () => {
+                document.getElementById('call-status').textContent = 'In Call';
+                startTimer();
+            });
+
+            activeCall.on('disconnect', () => {
+                endCall();
+            });
+
+            activeCall.on('error', (error) => {
+                console.error('Call Error:', error);
+                endCall();
+            });
+        }
+
+        function startTimer() {
+            timerInterval = setInterval(() => {
+                seconds++;
+                const mins = Math.floor(seconds / 60);
+                const secs = seconds % 60;
+                document.getElementById('call-timer').textContent =
+                    String(mins).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+            }, 1000);
+        }
+
+        function endCall() {
+            if (activeCall) activeCall.disconnect();
+            if (device) device.destroy();
+            clearInterval(timerInterval);
+            closeWidget();
+        }
+
+        function closeWidget() {
+            window.parent.postMessage('close-ai-widget', '*');
+        }
+
+        function toggleMute() {
+            if (activeCall) {
+                const isMuted = activeCall.isMuted();
+                activeCall.mute(!isMuted);
+            }
+        }
+    </script>
+</body>
+
+</html>

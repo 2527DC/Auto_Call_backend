@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Welcome</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f4f4f4;
+            margin: 0;
+            padding: 0;
+            -webkit-font-smoothing: antialiased;
+        }
+        .container {
+            max-width: 600px;
+            margin: 40px auto;
+            background-color: #ffffff;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+        }
+        .header {
+            background-color: #015482;
+            padding: 30px 20px;
+            text-align: center;
+            color: #ffffff;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 24px;
+            font-weight: 600;
+            color: #ffffff;
+        }
+        .body-content {
+            padding: 40px 30px;
+            color: #333333;
+            line-height: 1.6;
+        }
+        .body-content h2 {
+            font-size: 20px;
+            color: #222222;
+            margin-top: 0;
+        }
+        .btn-container {
+            text-align: center;
+            margin: 30px 0;
+        }
+        .btn {
+            display: inline-block;
+            padding: 12px 30px;
+            background-color: #015482;
+            color: #ffffff !important;
+            text-decoration: none;
+            border-radius: 5px;
+            font-weight: bold;
+            font-size: 16px;
+        }
+        .footer {
+            background-color: #f9f9f9;
+            padding: 20px;
+            text-align: center;
+            font-size: 12px;
+            color: #888888;
+            border-top: 1px solid #eeeeee;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Welcome to the AutoCall!</h1>
+        </div>
+        
+        <div class="body-content">
+            <h2>Hello <%= user_name %>,</h2>
+            
+            <p>We are thrilled to have you on board. Your account has been successfully created with the email address <strong><%= user_email %></strong>.</p>
+            
+            <p>Get started by logging into your account and exploring all the features we have to offer.</p>
+            
+            <div class="btn-container">
+                <a href="<%= login_url %>" class="btn">Login to Your Account</a>
+            </div>
+            
+            <p>If you have any questions or need assistance, feel free to reach out to our support team.</p>
+            
+            <p>Best regards,<br>AutoCall Team</p>
+        </div>
+        
+        <div class="footer">
+            <p>&copy; <%= new Date().getFullYear() %> All rights reserved.</p>
+            <p>This is an automated message. Please do not reply to this email.</p>
+        </div>
+    </div>
+</body>
+</html>

@@ -45,75 +45,79 @@ const deepgramVoices = [
 
 exports.up = async () => {
   try {
-    const elevenLabsVoices = await elevenlabsService.fetchVoices();
+    try {
+      const elevenLabsVoices = await elevenlabsService.fetchVoices();
 
-    if (!elevenLabsVoices || !Array.isArray(elevenLabsVoices)) {
-      throw new Error('Failed to fetch voices from ElevenLabs');
-    }
-
-    const voiceMap = new Map(elevenLabsVoices.map(v => [v.name.toLowerCase(), v]));
-
-    const accentMapping = {
-      'american': 'american',
-      'english': 'british',
-      'british': 'british',
-      'australian': 'australian',
-      'indian': 'indian',
-      'african': 'african',
-      'irish': 'british',
-      'italian': 'american',
-      'transatlantic': 'american'
-    };
-
-    for (const voice of voices) {
-      let match = voiceMap.get(voice.name.toLowerCase());
-      let voiceId;
-      let previewUrl;
-
-      if (!match) {
-        try {
-          const gender = voice.labels.gender.toLowerCase();
-          const age = voice.labels.age.toLowerCase().replace('-', '_');
-          const accent = accentMapping[voice.labels.accent.toLowerCase()] || 'american';
-
-          const preview = await elevenlabsService.generateVoicePreview({
-            gender,
-            age,
-            accent,
-            text: `Hello, I am ${voice.name}, your new ${voice.labels.description} voice.`
-          });
-
-          const created = await elevenlabsService.createVoiceFromPreview({
-            voice_name: voice.name,
-            voice_description: voice.labels.description,
-            generated_voice_id: preview.generated_voice_id,
-            labels: voice.labels
-          });
-
-          voiceId = created.voice_id;
-          console.log(`Successfully generated and saved voice: ${voice.name} (${voiceId})`);
-        } catch (genError) {
-          console.error(`Failed to generate voice "${voice.name}":`, genError.message);
-          continue;
-        }
-      } else {
-        voiceId = match.voice_id;
-        previewUrl = match.preview_url;
+      if (!elevenLabsVoices || !Array.isArray(elevenLabsVoices)) {
+        throw new Error('Failed to fetch voices from ElevenLabs');
       }
 
-      const voiceData = {
-        ...voice,
-        voice_id: voiceId,
-        preview_url: previewUrl,
-        provider: 'elevenlabs',
-        status: 'active'
+      const voiceMap = new Map(elevenLabsVoices.map(v => [v.name.toLowerCase(), v]));
+
+      const accentMapping = {
+        'american': 'american',
+        'english': 'british',
+        'british': 'british',
+        'australian': 'australian',
+        'indian': 'indian',
+        'african': 'african',
+        'irish': 'british',
+        'italian': 'american',
+        'transatlantic': 'american'
       };
 
-      await Voice.findOneAndUpdate(
-        { voice_id: voiceData.voice_id },
-        voiceData,
-        { upsert: true, new: true }
-      );
+      for (const voice of voices) {
+        let match = voiceMap.get(voice.name.toLowerCase());
+        let voiceId;
+        let previewUrl;
+
+        if (!match) {
+          try {
+            const gender = voice.labels.gender.toLowerCase();
+            const age = voice.labels.age.toLowerCase().replace('-', '_');
+            const accent = accentMapping[voice.labels.accent.toLowerCase()] || 'american';
+
+            const preview = await elevenlabsService.generateVoicePreview({
+              gender,
+              age,
+              accent,
+              text: `Hello, I am ${voice.name}, your new ${voice.labels.description} voice.`
+            });
+
+            const created = await elevenlabsService.createVoiceFromPreview({
+              voice_name: voice.name,
+              voice_description: voice.labels.description,
+              generated_voice_id: preview.generated_voice_id,
+              labels: voice.labels
+            });
+
+            voiceId = created.voice_id;
+            console.log(`Successfully generated and saved voice: ${voice.name} (${voiceId})`);
+          } catch (genError) {
+            console.error(`Failed to generate voice "${voice.name}":`, genError.message);
+            continue;
+          }
+        } else {
+          voiceId = match.voice_id;
+          previewUrl = match.preview_url;
+        }
+
+        const voiceData = {
+          ...voice,
+          voice_id: voiceId,
+          preview_url: previewUrl,
+          provider: 'elevenlabs',
+          status: 'active'
+        };
+
+        await Voice.findOneAndUpdate(
+          { voice_id: voiceData.voice_id },
+          voiceData,
+          { upsert: true, new: true }
+        );
+      }
+    } catch (elError) {
+      console.warn('ElevenLabs voice seeding skipped (missing or invalid API key):', elError.message);
     }
 
     console.log('Seeding Deepgram Aura voices...');

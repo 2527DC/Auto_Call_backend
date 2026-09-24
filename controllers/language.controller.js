@@ -13,7 +13,7 @@ const DEFAULT_PAGE = 1;
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 100;
 const DEFAULT_SORT_FIELD = 'sort_order';
-const ALLOWED_SORT_FIELDS = ['name', 'locale', 'is_rtl', 'is_active', 'sort_order', 'created_at', 'updated_at'];
+const ALLOWED_SORT_FIELDS = ['name', 'locale', 'is_active', 'sort_order', 'created_at', 'updated_at'];
 
 const parsePaginationParams = (query) => {
   const page = Math.max(1, parseInt(query.page) || DEFAULT_PAGE);
@@ -151,7 +151,7 @@ exports.createLanguage = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Language validation failed', errors: validation.errors });
     }
 
-    const { name, locale, is_rtl, is_active, is_default } = languageData;
+    const { name, locale, is_active, is_default } = languageData;
     const languageLocale = locale.trim();
 
     const existingLanguage = await Language.findOne({ locale: languageLocale });
@@ -190,7 +190,6 @@ exports.createLanguage = async (req, res) => {
       locale: languageLocale,
       flag: flagPath,
       front_translation_file: frontFile,
-      is_rtl: is_rtl !== undefined ? is_rtl : false,
       is_active: is_active !== undefined ? is_active : true,
       is_default: is_default === true || is_default === 'true',
     });
@@ -312,9 +311,6 @@ exports.updateLanguage = async (req, res) => {
       language.flag = updateData.flag;
     }
 
-    if (updateData.is_rtl !== undefined) {
-      language.is_rtl = updateData.is_rtl;
-    }
 
     if (updateData.sort_order !== undefined) {
       language.sort_order = updateData.sort_order;

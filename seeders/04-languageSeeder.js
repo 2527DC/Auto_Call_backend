@@ -18,7 +18,6 @@ const seedLanguage = async (dbConnection, mongoose) => {
         locale: 'en',
         flag: 'uploads/languages/en/us.svg',
         front_translation_file: 'uploads/languages/en/english-autocall.json',
-        is_rtl: false,
         is_active: true,
         is_default: true,
         sort_order: 0,

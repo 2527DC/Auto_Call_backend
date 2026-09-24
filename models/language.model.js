@@ -25,10 +25,6 @@ const LanguageSchema = new Schema(
       default: null
     },
 
-    is_rtl: {
-      type: Boolean,
-      default: false
-    },
     is_active: {
       type: Boolean,
       default: true

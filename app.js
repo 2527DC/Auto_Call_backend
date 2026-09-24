@@ -13,7 +13,6 @@ const app = express();
 dotenv.config();
 
 app.set('trust proxy', true);
-// const { rtInit } = require('./node/src/middlewares/runtime-init.js');
 
 
 app.use(session({
@@ -73,18 +72,6 @@ app.use((req, res, next) => {
 
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/widget', express.static(path.join(__dirname, 'public/widget')));
-// app.use('/install', express.static(path.join(__dirname, 'public/install')));
-
-// const { initializeInstaller, createInstallationMiddleware } = require('./lib/install');
-try {
-  // initializeInstaller(app);
-  console.log('Installer initialized');
-} catch (err) {
-  console.error('Failed to initialize installer:', err);
-}
-
-// app.use(createInstallationMiddleware());
-
 const authRoutes = require('./routes/auth.routes');
 const userRoutes = require('./routes/user.routes');
 const faqRoutes = require('./routes/faq.routes');

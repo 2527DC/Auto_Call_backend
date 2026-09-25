@@ -68,26 +68,28 @@ jobs:
       PM2_NAME: ${{ vars.BACKEND_PM2_NAME || 'autocall-backend' }}
       APP_PORT: ${{ vars.BACKEND_PORT || '5000' }}
       RELEASE: ${{ github.sha }}
+      SSHPASS: ${{ secrets.VPS_PASSWORD }}
+      SSH_OPTS: -o PreferredAuthentications=password -o PubkeyAuthentication=no
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: backend-release
 
+      # Password login: sshpass feeds VPS_PASSWORD (read from $SSHPASS) to ssh/scp.
       - name: Set up SSH
         run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
           install -m 700 -d ~/.ssh
-          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_deploy
-          chmod 600 ~/.ssh/id_deploy
           printf '%s\n' "${{ secrets.VPS_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
 
       - name: Upload release to VPS
         run: |
-          scp -i ~/.ssh/id_deploy -P "$VPS_PORT" backend.tar.gz \
+          sshpass -e scp $SSH_OPTS -P "$VPS_PORT" backend.tar.gz \
             "$VPS_USER@$VPS_HOST:/tmp/backend-$RELEASE.tar.gz"
 
       - name: Activate release with PM2
         run: |
-          ssh -i ~/.ssh/id_deploy -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" \
+          sshpass -e ssh $SSH_OPTS -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" \
             "APP_DIR='$APP_DIR' PM2_NAME='$PM2_NAME' APP_PORT='$APP_PORT' RELEASE='$RELEASE' bash -s" <<'REMOTE'
           set -euo pipefail
 

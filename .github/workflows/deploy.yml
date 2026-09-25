@@ -1,0 +1,151 @@
+name: Deploy backend
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never run two deploys to the same VPS at once.
+concurrency:
+  group: deploy-backend-production
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  build:
+    # Must match the VPS CPU: use ubuntu-24.04-arm if the VPS is ARM (aarch64).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # package-lock.json is gitignored in this repo, so fall back to npm install.
+      - name: Install production dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --omit=dev
+          else
+            npm install --omit=dev
+          fi
+
+      - name: Syntax check every source file
+        run: find . -name '*.js' -not -path './node_modules/*' -print0 | xargs -0 -n1 node --check
+
+      # The release holds only what the server runs: source + production node_modules.
+      # No .git, no .env, no uploads, no Docker/dev files.
+      - name: Package release
+        run: |
+          tar -czf "$RUNNER_TEMP/backend.tar.gz" \
+            --exclude=./.git \
+            --exclude=./.github \
+            --exclude=./.env \
+            --exclude=./uploads \
+            --exclude=./Dockerfile \
+            --exclude=./.dockerignore \
+            --exclude=./nodemon.json \
+            .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-release
+          path: ${{ runner.temp }}/backend.tar.gz
+          retention-days: 7
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: production
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_PORT: ${{ vars.VPS_PORT || '22' }}
+      APP_DIR: ${{ vars.BACKEND_APP_DIR || '/var/www/autocall-backend' }}
+      PM2_NAME: ${{ vars.BACKEND_PM2_NAME || 'autocall-backend' }}
+      APP_PORT: ${{ vars.BACKEND_PORT || '5000' }}
+      RELEASE: ${{ github.sha }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: backend-release
+
+      - name: Set up SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "${{ secrets.VPS_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Upload release to VPS
+        run: |
+          scp -i ~/.ssh/id_deploy -P "$VPS_PORT" backend.tar.gz \
+            "$VPS_USER@$VPS_HOST:/tmp/backend-$RELEASE.tar.gz"
+
+      - name: Activate release with PM2
+        run: |
+          ssh -i ~/.ssh/id_deploy -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" \
+            "APP_DIR='$APP_DIR' PM2_NAME='$PM2_NAME' APP_PORT='$APP_PORT' RELEASE='$RELEASE' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          RELEASE_DIR="$APP_DIR/releases/$RELEASE"
+          ARCHIVE="/tmp/backend-$RELEASE.tar.gz"
+
+          if [ ! -f "$APP_DIR/shared/.env" ]; then
+            echo "Missing $APP_DIR/shared/.env - create it on the VPS first." >&2
+            exit 1
+          fi
+
+          mkdir -p "$RELEASE_DIR" "$APP_DIR/shared/uploads"
+          tar -xzf "$ARCHIVE" -C "$RELEASE_DIR"
+          rm -f "$ARCHIVE"
+
+          # .env and uploads live outside releases so they survive every deploy.
+          ln -sfn "$APP_DIR/shared/.env" "$RELEASE_DIR/.env"
+          ln -sfn "$APP_DIR/shared/uploads" "$RELEASE_DIR/uploads"
+
+          PREVIOUS="$(readlink -f "$APP_DIR/current" 2>/dev/null || true)"
+          ln -sfn "$RELEASE_DIR" "$APP_DIR/current"
+
+          start_or_reload() {
+            if pm2 describe "$PM2_NAME" >/dev/null 2>&1; then
+              PORT="$APP_PORT" pm2 reload "$PM2_NAME" --update-env
+            else
+              # Fork mode, one instance: WebRTC calls and sockets are kept in memory.
+              PORT="$APP_PORT" pm2 start "$APP_DIR/current/server.js" \
+                --name "$PM2_NAME" --cwd "$APP_DIR/current" --time
+            fi
+          }
+
+          healthy() {
+            for _ in $(seq 1 15); do
+              code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$APP_PORT/" || true)"
+              if [ "$code" != "000" ]; then return 0; fi
+              sleep 2
+            done
+            return 1
+          }
+
+          start_or_reload
+
+          if ! healthy; then
+            echo "New release did not answer on port $APP_PORT." >&2
+            pm2 logs "$PM2_NAME" --lines 50 --nostream || true
+            if [ -n "$PREVIOUS" ] && [ "$PREVIOUS" != "$RELEASE_DIR" ]; then
+              echo "Rolling back to $PREVIOUS" >&2
+              ln -sfn "$PREVIOUS" "$APP_DIR/current"
+              start_or_reload
+            fi
+            exit 1
+          fi
+
+          pm2 save
+
+          # Keep the 5 newest releases for manual rollback.
+          ls -1dt "$APP_DIR"/releases/*/ | tail -n +6 | xargs -r rm -rf
+
+          echo "Deployed $RELEASE"
+          REMOTE

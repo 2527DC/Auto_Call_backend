@@ -7,6 +7,7 @@ const deepgramService = require('./deepgramService');
 const sarvamService = require('./sarvamService');
 const appointmentService = require('./appointmentService');
 const twilio = require('twilio');
+const plivo = require('plivo');
 const { db } = require('../models');
 const Call = db.Call;
 const Flow = db.Flow;
@@ -30,6 +31,8 @@ class VoiceAutomationService extends EventEmitter {
     super();
     this.activeStreams = new Map();
     this.twilioClient = null;
+    // Call UUIDs of live Plivo streams, so call control goes to Plivo instead of Twilio.
+    this.plivoCallIds = new Set();
   }
 
   async getTwilioClient(userId) {
@@ -45,6 +48,123 @@ class VoiceAutomationService extends EventEmitter {
     return null;
   }
 
+  // Client for hanging up / redirecting live calls. Keeps Twilio's
+  // client.calls(id).update(...) shape but routes Plivo calls to the Plivo API.
+  async getCallControlClient(userId) {
+    if (!userId) return null;
+
+    const twilioClient = await this.getTwilioClient(userId);
+    const settings = await UserSettings.findOne({ user: userId });
+    const plivoAuthId = settings?.plivo_auth_id || process.env.PLIVO_AUTH_ID;
+    const plivoAuthToken = settings?.plivo_auth_token || process.env.PLIVO_AUTH_TOKEN;
+    if (!plivoAuthId || !plivoAuthToken || this.plivoCallIds.size === 0) {
+      return twilioClient;
+    }
+
+    const plivoClient = new plivo.Client(plivoAuthId, plivoAuthToken);
+    const client = Object.create(twilioClient || {});
+    client.calls = (callId) => {
+      if (!this.plivoCallIds.has(callId)) {
+        return twilioClient ? twilioClient.calls(callId) : { update: async () => {} };
+      }
+      return {
+        update: async (opts = {}) => {
+          if (opts.status === 'completed') {
+            await plivoClient.calls.hangup(callId);
+          } else {
+            console.warn(`[Plivo] Call update not supported for Plivo calls (${Object.keys(opts).join(', ')}); call ${callId} left unchanged.`);
+          }
+        }
+      };
+    };
+    return client;
+  }
+
+  // Plivo sends context as "key=value;key=value" (keys may carry an X-PH- prefix).
+  parsePlivoExtraHeaders(extraHeaders) {
+    if (!extraHeaders) return {};
+    if (typeof extraHeaders === 'object') return extraHeaders;
+    return String(extraHeaders).split(';').reduce((acc, pair) => {
+      const [key, ...rest] = pair.split('=');
+      if (key && rest.length) acc[key.trim().replace(/^X-PH-/i, '')] = rest.join('=').trim();
+      return acc;
+    }, {});
+  }
+
+  // Sends one synthesized utterance (8 kHz mu-law, base64) and signals when playback ends.
+  sendAgentAudio(ws, streamSid, base64Audio) {
+    const stream = this.activeStreams.get(streamSid);
+
+    if (stream?.provider !== 'plivo') {
+      ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: base64Audio } }));
+      ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'agent-speech-completed' } }));
+      return;
+    }
+
+    // Plivo caps WebSocket messages at 64 KB, so send about one second per message.
+    const audio = Buffer.from(base64Audio, 'base64');
+    const CHUNK_BYTES = 8000;
+    for (let offset = 0; offset < audio.length; offset += CHUNK_BYTES) {
+      ws.send(JSON.stringify({
+        event: 'playAudio',
+        media: {
+          contentType: 'audio/x-mulaw',
+          sampleRate: 8000,
+          payload: audio.subarray(offset, offset + CHUNK_BYTES).toString('base64')
+        }
+      }));
+    }
+
+    // Plivo queues audio; fire the "speech finished" step when this utterance
+    // should have finished playing (8000 mu-law bytes per second).
+    const now = Date.now();
+    stream.playbackEndsAt = Math.max(now, stream.playbackEndsAt || 0) + Math.ceil(audio.length / 8);
+    setTimeout(() => {
+      this.handlePlaybackComplete(streamSid).catch(err => console.error('[Plivo] Playback completion error:', err.message));
+    }, stream.playbackEndsAt - now + 300);
+  }
+
+  endStream(streamSid) {
+    const closingStream = this.activeStreams.get(streamSid);
+    if (!closingStream) return;
+    if (closingStream.callSid) {
+      this.handlePostCallIntegrations(closingStream.callSid, closingStream.userId);
+      this.plivoCallIds.delete(closingStream.callSid);
+    }
+    this.activeStreams.delete(streamSid);
+    console.log(`Stream stopped: ${streamSid}`);
+  }
+
+  async handlePlaybackComplete(streamSid) {
+    const streamForMark = this.activeStreams.get(streamSid);
+    if (streamForMark && streamForMark.pendingTransfer) {
+      console.log(`[Flow] Speech completed, executing pending transfer to: ${streamForMark.pendingTransfer}`);
+      const client = await this.getCallControlClient(streamForMark.userId);
+      if (client && streamForMark.callSid) {
+        try {
+          const actionUrl = process.env.APP_URL ? `${process.env.APP_URL}/api/calls/transfer-status` : '';
+          await client.calls(streamForMark.callSid).update({
+            twiml: `<Response><Dial action="${actionUrl}"${streamForMark.pendingTransferRecordAttribute || ''}>${streamForMark.pendingTransfer}</Dial></Response>`
+          });
+          streamForMark.pendingTransfer = null;
+        } catch (err) {
+          console.error('Error transferring call after mark:', err.message);
+        }
+      }
+    } else if (streamForMark && streamForMark.pendingTerminate) {
+      console.log(`[Flow] Speech completed, terminating call gracefully.`);
+      const client = await this.getCallControlClient(streamForMark.userId);
+      if (client && streamForMark.callSid) {
+        try {
+          await client.calls(streamForMark.callSid).update({ status: 'completed' });
+          streamForMark.pendingTerminate = false;
+        } catch (err) {
+          console.error('Error terminating call after mark:', err.message);
+        }
+      }
+    }
+  }
+
   handleMediaStream(ws) {
     let callSid = null;
     let streamSid = null;
@@ -57,14 +177,19 @@ class VoiceAutomationService extends EventEmitter {
 
       switch (msg.event) {
         case 'start':
-          callSid = msg.start.callSid;
-          streamSid = msg.start.streamSid;
-          const customData = msg.start.customParameters || {};
+          const isPlivo = !!msg.start.streamId;
+          callSid = isPlivo ? msg.start.callId : msg.start.callSid;
+          streamSid = isPlivo ? msg.start.streamId : msg.start.streamSid;
+          const customData = isPlivo
+            ? this.parsePlivoExtraHeaders(msg.start.extraHeaders)
+            : (msg.start.customParameters || {});
+          if (isPlivo && callSid) this.plivoCallIds.add(callSid);
           flowId = customData.flowId && customData.flowId !== 'undefined' && customData.flowId !== 'null' ? customData.flowId : null;
           agentId = customData.agentId && customData.agentId !== 'undefined' && customData.agentId !== 'null' ? customData.agentId : null;
           userId = customData.userId && customData.userId !== 'undefined' && customData.userId !== 'null' ? customData.userId : null;
 
           this.activeStreams.set(streamSid, {
+            provider: isPlivo ? 'plivo' : 'twilio',
             callSid,
             flowId,
             agentId,
@@ -159,7 +284,7 @@ class VoiceAutomationService extends EventEmitter {
                   }
                   const actionUrl = process.env.APP_URL ? `${process.env.APP_URL}/api/calls/transfer-status` : '';
                   const recordAttribute = (agent?.enable_call_recording || agent?.enable_call_transcription) ? ' record="record-from-answer-dual"' : '';
-                  const client = await this.getTwilioClient(userId);
+                  const client = await this.getCallControlClient(userId);
                   if (client && callSid) {
                     try {
                       if (userSettings?.elevenlabs_api_key) {
@@ -195,7 +320,7 @@ class VoiceAutomationService extends EventEmitter {
                 const playAudioUrl = result.logs.filter(l => l.output && l.output.play_audio).map(l => l.output.play_audio)[0];
                 const terminateLog = result.logs.find(l => l.node_type === 'terminate_call');
                 if (playAudioUrl) {
-                  const client = await this.getTwilioClient(userId);
+                  const client = await this.getCallControlClient(userId);
                   if (client) {
                     const appUrl = process.env.APP_URL ? process.env.APP_URL.replace('http', 'ws') : 'wss://domain.com';
                     const httpUrl = process.env.APP_URL || 'https://domain.com';
@@ -220,7 +345,7 @@ class VoiceAutomationService extends EventEmitter {
                   }
                   await this.speak(ws, streamSid, fullMessage, flow.nodes[0]?.data?.voice_id, userSettings?.elevenlabs_api_key);
                 } else if (terminateLog) {
-                  const client = await this.getTwilioClient(userId);
+                  const client = await this.getCallControlClient(userId);
                   if (client && callSid) {
                     try {
                       await client.calls(callSid).update({ status: 'completed' });
@@ -296,48 +421,19 @@ class VoiceAutomationService extends EventEmitter {
           break;
 
         case 'mark':
-          const streamForMark = this.activeStreams.get(streamSid);
-          if (streamForMark && streamForMark.pendingTransfer) {
-            console.log(`[Flow] Speech completed, executing pending transfer to: ${streamForMark.pendingTransfer}`);
-            const client = await this.getTwilioClient(streamForMark.userId);
-            if (client && streamForMark.callSid) {
-              try {
-                const actionUrl = process.env.APP_URL ? `${process.env.APP_URL}/api/calls/transfer-status` : '';
-                await client.calls(streamForMark.callSid).update({
-                  twiml: `<Response><Dial action="${actionUrl}"${streamForMark.pendingTransferRecordAttribute || ''}>${streamForMark.pendingTransfer}</Dial></Response>`
-                });
-                streamForMark.pendingTransfer = null;
-              } catch (err) {
-                console.error('Error transferring call after mark:', err.message);
-              }
-            }
-          } else if (streamForMark && streamForMark.pendingTerminate) {
-            console.log(`[Flow] Speech completed, terminating call gracefully.`);
-            const client = await this.getTwilioClient(streamForMark.userId);
-            if (client && streamForMark.callSid) {
-              try {
-                await client.calls(streamForMark.callSid).update({ status: 'completed' });
-                streamForMark.pendingTerminate = false;
-              } catch (err) {
-                console.error('Error terminating call after mark:', err.message);
-              }
-            }
-          }
+          await this.handlePlaybackComplete(streamSid);
           break;
 
         case 'stop':
-          const closingStream = this.activeStreams.get(streamSid);
-          if (closingStream && closingStream.callSid) {
-            this.handlePostCallIntegrations(closingStream.callSid, closingStream.userId);
-          }
-          this.activeStreams.delete(streamSid);
-          console.log(`Stream stopped: ${streamSid}`);
+          this.endStream(streamSid);
           break;
       }
     });
 
     ws.on('close', () => {
-      console.log('Twilio Media Stream WebSocket closed');
+      console.log('Media Stream WebSocket closed');
+      // Plivo does not always send a 'stop' event, so clean up on close too.
+      if (streamSid) this.endStream(streamSid);
     });
 
     ws.on('error', (err) => {
@@ -377,7 +473,7 @@ class VoiceAutomationService extends EventEmitter {
           earlyUserSettings = await UserSettings.findOne({ user: stream.userId });
           await this.speak(ws, streamSid, goodbyeMessage, currentAgentForChecks.voice_id || null, earlyUserSettings?.elevenlabs_api_key);
 
-          const client = await this.getTwilioClient(stream.userId);
+          const client = await this.getCallControlClient(stream.userId);
           if (client && stream.callSid) {
             try {
               await client.calls(stream.callSid).update({ status: 'completed' });
@@ -408,7 +504,7 @@ class VoiceAutomationService extends EventEmitter {
           }
           const transferNumber = member.phone_number;
 
-          const client = await this.getTwilioClient(stream.userId);
+          const client = await this.getCallControlClient(stream.userId);
           if (client && stream.callSid) {
             try {
               const actionUrl = process.env.APP_URL ? `${process.env.APP_URL}/api/calls/transfer-status` : '';
@@ -469,7 +565,7 @@ class VoiceAutomationService extends EventEmitter {
       }
       await this.speak(ws, streamSid, goodbyeMessage, currentAgentForChecks?.voice_id || null, earlyUserSettings?.elevenlabs_api_key);
 
-      const client = await this.getTwilioClient(stream.userId);
+      const client = await this.getCallControlClient(stream.userId);
       if (client && stream.callSid) {
         try {
           await client.calls(stream.callSid).update({ status: 'completed' });
@@ -561,7 +657,7 @@ class VoiceAutomationService extends EventEmitter {
             } else {
               await this.speak(ws, streamSid, "Please hold while I transfer your call.", currentAgent?.voice_id || null, userSettings?.elevenlabs_api_key);
             }
-            const client = await this.getTwilioClient(stream.userId);
+            const client = await this.getCallControlClient(stream.userId);
             if (client && stream.callSid) {
               try {
                 const actionUrl = process.env.APP_URL ? `${process.env.APP_URL}/api/calls/transfer-status` : '';
@@ -607,7 +703,7 @@ class VoiceAutomationService extends EventEmitter {
           const terminateLog = result.logs.find(l => l.node_type === 'terminate_call');
 
           if (playAudioUrl) {
-            const client = await this.getTwilioClient(stream.userId);
+            const client = await this.getCallControlClient(stream.userId);
             if (client) {
               const appUrl = process.env.APP_URL ? process.env.APP_URL.replace('http', 'ws') : 'wss://domain.com';
               const httpUrl = process.env.APP_URL || 'https://domain.com';
@@ -634,7 +730,7 @@ class VoiceAutomationService extends EventEmitter {
               currentCallLog.transcript.push({ role: 'agent', text: nextResponse });
             }
           } else if (terminateLog) {
-            const client = await this.getTwilioClient(stream.userId);
+            const client = await this.getCallControlClient(stream.userId);
             if (client && stream.callSid) {
               try {
                 await client.calls(stream.callSid).update({ status: 'completed' });
@@ -797,14 +893,7 @@ class VoiceAutomationService extends EventEmitter {
         const pcmBuffer = await deepgramService.generateSpeech(text, activeVoiceId || 'aura-asteria-en', {}, dgApiKey, 8000);
         const ulawBuffer = this.encodePcmToUlaw(pcmBuffer, 8000);
         const base64Audio = ulawBuffer.toString('base64');
-        ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: base64Audio } }));
-
-        const markMessage = {
-          event: 'mark',
-          streamSid: streamSid,
-          mark: { name: 'agent-speech-completed' }
-        };
-        ws.send(JSON.stringify(markMessage));
+        this.sendAgentAudio(ws, streamSid, base64Audio);
         return;
       }
 
@@ -825,14 +914,7 @@ class VoiceAutomationService extends EventEmitter {
         const pcmBuffer = await sarvamService.generateSpeech(text, activeVoiceId || 'shubh', {}, sarvamApiKey, 8000);
         const ulawBuffer = this.encodePcmToUlaw(pcmBuffer, pcmBuffer.sampleRate || 8000);
         const base64Audio = ulawBuffer.toString('base64');
-        ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: base64Audio } }));
-
-        const markMessage = {
-          event: 'mark',
-          streamSid: streamSid,
-          mark: { name: 'agent-speech-completed' }
-        };
-        ws.send(JSON.stringify(markMessage));
+        this.sendAgentAudio(ws, streamSid, base64Audio);
         return;
       }
 
@@ -849,14 +931,7 @@ class VoiceAutomationService extends EventEmitter {
       const pcmBuffer = await elevenLabsService.generateSpeech(text, activeVoiceId || 'JBFqnCBsd6RMkjVDRZzb', {}, elApiKey);
       const ulawBuffer = this.encodePcmToUlaw(pcmBuffer, 16000);
       const base64Audio = ulawBuffer.toString('base64');
-      ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: base64Audio } }));
-      
-      const markMessage = {
-        event: 'mark',
-        streamSid: streamSid,
-        mark: { name: 'agent-speech-completed' }
-      };
-      ws.send(JSON.stringify(markMessage));
+      this.sendAgentAudio(ws, streamSid, base64Audio);
     } catch (err) {
       console.error(`[${provider || activeProvider || 'ElevenLabs'}] TTS failed, falling back to Twilio <Say>:`, err.message);
       await this.speakViaTwiml(streamSid, text);
@@ -871,7 +946,7 @@ class VoiceAutomationService extends EventEmitter {
         return;
       }
 
-      const client = await this.getTwilioClient(stream.userId);
+      const client = await this.getCallControlClient(stream.userId);
       if (!client) {
         console.error('[TwiML Say] No Twilio client available.');
         return;

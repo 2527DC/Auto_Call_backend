@@ -204,30 +204,26 @@ exports.generateTwiML = async (req, res) => {
   res.send(twiml);
 };
 
+// Plivo's <Stream> takes the WebSocket URL as its text and passes context as
+// "key=value;key=value" extraHeaders (it has no Twilio-style <Parameter> children).
+const buildPlivoStreamXml = ({ flowId, agentId, userId }) => {
+  const appUrl = process.env.APP_URL.replace('http', 'ws');
+  const headers = Object.entries({ flowId, agentId, userId })
+    .filter(([, value]) => value && value !== 'undefined' && value !== 'null')
+    .map(([key, value]) => `${key}=${value}`)
+    .join(';');
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000" extraHeaders="${headers}">${appUrl}</Stream>
+</Response>`;
+};
+
 exports.generatePlivoXML = async (req, res) => {
   const { flowId, userId, agentId } = req.query;
-  const appUrl = process.env.APP_URL.replace('http', 'ws');
-
-  let parametersXml = '';
-  if (flowId && flowId !== 'undefined') {
-    parametersXml += `<Parameter name="flowId" value="${flowId}" />\n`;
-  }
-  if (userId && userId !== 'undefined') {
-    parametersXml += `<Parameter name="userId" value="${userId}" />\n`;
-  }
-  if (agentId && agentId !== 'undefined') {
-    parametersXml += `<Parameter name="agentId" value="${agentId}" />`;
-  }
-
-  const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Stream url="${appUrl}" keepCallAlive="true">
-        ${parametersXml}
-    </Stream>
-</Response>`;
 
   res.type('text/xml');
-  res.send(xml);
+  res.send(buildPlivoStreamXml({ flowId, agentId, userId }));
 };
 
 exports.handleStatusCallback = async (req, res) => {
@@ -854,7 +850,13 @@ exports.handlePlivoInboundCall = async (req, res) => {
   try {
     const { To, From, CallUUID } = req.body;
 
-    const numberRecord = await PhoneNumber.findOne({ phone_number: To }).populate('agent_id');
+    // Plivo sends numbers without the leading "+", while numbers are stored in E.164.
+    const numberVariants = (value) => {
+      const digits = String(value || '').replace(/^\+/, '');
+      return [digits, `+${digits}`];
+    };
+
+    const numberRecord = await PhoneNumber.findOne({ phone_number: { $in: numberVariants(To) } }).populate('agent_id');
     if (!numberRecord || !numberRecord.agent_id) {
       const errorXml = `<?xml version="1.0" encoding="UTF-8"?><Response><Speak>Sorry, this number is not configured for AI assistance.</Speak></Response>`;
       res.type('text/xml');
@@ -866,7 +868,7 @@ exports.handlePlivoInboundCall = async (req, res) => {
     const agentId = agent._id;
     const userId = agent.user_id;
 
-    const contact = await Contact.findOne({ user_id: userId, phone_number: From });
+    const contact = await Contact.findOne({ user_id: userId, phone_number: { $in: numberVariants(From) } });
     if (contact && contact.is_blocked) {
       const blockXml = `<?xml version="1.0" encoding="UTF-8"?><Response><Hangup reason="busy"/></Response>`;
       res.type('text/xml');
@@ -886,28 +888,8 @@ exports.handlePlivoInboundCall = async (req, res) => {
     });
     webhookDispatcher.dispatchEvent(userId, 'Inbound Call Arrived', callLog);
 
-    const appUrl = process.env.APP_URL.replace('http', 'ws');
-
-    let parametersXml = '';
-    if (flowId && flowId !== 'undefined') {
-      parametersXml += `<Parameter name="flowId" value="${flowId}" />\n`;
-    }
-    if (agentId && agentId !== 'undefined') {
-      parametersXml += `<Parameter name="agentId" value="${agentId}" />\n`;
-    }
-    if (userId && userId !== 'undefined') {
-      parametersXml += `<Parameter name="userId" value="${userId}" />`;
-    }
-
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Stream url="${appUrl}" keepCallAlive="true">
-        ${parametersXml}
-    </Stream>
-</Response>`;
-
     res.type('text/xml');
-    res.send(xml);
+    res.send(buildPlivoStreamXml({ flowId, agentId, userId }));
   } catch (error) {
     console.error('Plivo Inbound Call Error:', error);
     res.status(500).send('Internal Server Error');

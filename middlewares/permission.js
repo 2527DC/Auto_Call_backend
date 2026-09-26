@@ -5,6 +5,21 @@ const Permission = db.Permission;
 const RolePermission = db.RolePermission;
 const Team = db.Team;
 const TeamPermission = db.TeamPermission;
+const { checkActiveSubscription, permissionNeedsSubscription } = require('./subscription');
+
+// Customers (and their team members / API keys) need an active plan for any
+// action beyond viewing; admins are exempt.
+const subscriptionBlock = async (user, roleName, permissionSlug) => {
+  if (roleName === 'super_admin' || roleName === 'admin') return null;
+  if (!permissionNeedsSubscription(permissionSlug)) return null;
+  const ownerId = user.isTeamMember ? user.user_id : user._id;
+  if (!ownerId) return null;
+  const result = await checkActiveSubscription(ownerId);
+  return result.ok ? null : result;
+};
+
+const sendSubscriptionBlock = (res, block) =>
+  res.status(402).json({ success: false, code: block.code, message: block.message });
 
 exports.checkPermission = (permissionSlug) => {
   return async (req, res, next) => {
@@ -24,6 +39,8 @@ exports.checkPermission = (permissionSlug) => {
 
       if (req.authType === 'api_key') {
         if (req.user.permissionSlugs && req.user.permissionSlugs.includes(permissionSlug)) {
+          const block = await subscriptionBlock(user, roleName, permissionSlug);
+          if (block) return sendSubscriptionBlock(res, block);
           return next();
         }
         return res.status(403).json({ success: false, message: 'Access denied: API Key required permissions' });
@@ -49,6 +66,9 @@ exports.checkPermission = (permissionSlug) => {
           return res.status(403).json({ success: false, message: 'Access denied: Team permission missing' });
         }
 
+        const teamBlock = await subscriptionBlock(user, roleName, permissionSlug);
+        if (teamBlock) return sendSubscriptionBlock(res, teamBlock);
+
         return next();
       }
 
@@ -70,6 +90,9 @@ exports.checkPermission = (permissionSlug) => {
       if (!hasPermission) {
         return res.status(403).json({ success: false, message: 'Access denied: Insufficient permissions' });
       }
+
+      const block = await subscriptionBlock(user, roleName, permissionSlug);
+      if (block) return sendSubscriptionBlock(res, block);
 
       return next();
 

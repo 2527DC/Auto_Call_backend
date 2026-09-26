@@ -40,9 +40,9 @@ const PORT = process.env.PORT || 3000;
     const wss = new WebSocketServer({ server, path: '/' });
     const voiceAutomationService = require('./services/voiceAutomationService');
 
-    wss.on('connection', (ws) => {
-      console.log('Twilio Media Stream WebSocket connected');
-      voiceAutomationService.handleMediaStream(ws);
+    wss.on('connection', (ws, req) => {
+      console.log('Media Stream WebSocket connected');
+      voiceAutomationService.handleMediaStream(ws, req);
     });
 
     server.listen(PORT, () => {

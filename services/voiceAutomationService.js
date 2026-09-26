@@ -86,7 +86,11 @@ class VoiceAutomationService extends EventEmitter {
     if (typeof extraHeaders === 'object') return extraHeaders;
     return String(extraHeaders).split(';').reduce((acc, pair) => {
       const [key, ...rest] = pair.split('=');
-      if (key && rest.length) acc[key.trim().replace(/^X-PH-/i, '')] = rest.join('=').trim();
+      if (key && rest.length) {
+        const name = key.trim().replace(/^X-PH-/i, '');
+        const canonical = { agentid: 'agentId', userid: 'userId', flowid: 'flowId' }[name.toLowerCase()] || name;
+        acc[canonical] = rest.join('=').trim();
+      }
       return acc;
     }, {});
   }
@@ -165,7 +169,7 @@ class VoiceAutomationService extends EventEmitter {
     }
   }
 
-  handleMediaStream(ws) {
+  handleMediaStream(ws, req = null) {
     let callSid = null;
     let streamSid = null;
     let flowId = null;
@@ -177,13 +181,31 @@ class VoiceAutomationService extends EventEmitter {
 
       switch (msg.event) {
         case 'start':
-          const isPlivo = !!msg.start.streamId;
-          callSid = isPlivo ? msg.start.callId : msg.start.callSid;
-          streamSid = isPlivo ? msg.start.streamId : msg.start.streamSid;
-          const customData = isPlivo
-            ? this.parsePlivoExtraHeaders(msg.start.extraHeaders)
-            : (msg.start.customParameters || {});
-          if (isPlivo && callSid) this.plivoCallIds.add(callSid);
+          const isPlivo = !!(msg.start.streamId || msg.streamId);
+          callSid = isPlivo ? (msg.start.callId || msg.start.callUUID || msg.callId) : msg.start.callSid;
+          streamSid = isPlivo ? (msg.start.streamId || msg.streamId) : msg.start.streamSid;
+          let customData = msg.start.customParameters || {};
+          if (isPlivo) {
+            this.plivoCallIds.add(callSid);
+            console.log(`[Plivo] Stream start fields: ${Object.keys(msg.start).join(', ')} | handshake headers: ${Object.keys(req?.headers || {}).join(', ')}`);
+            // Plivo's extraHeaders may arrive in the start event or on the WebSocket handshake.
+            customData = {
+              ...this.parsePlivoExtraHeaders(req?.headers?.['x-ph-extraheaders'] || req?.headers?.['extraheaders']),
+              ...Object.fromEntries(['agentid', 'userid', 'flowid']
+                .filter(key => req?.headers?.[`x-ph-${key}`] || req?.headers?.[key])
+                .map(key => [{ agentid: 'agentId', userid: 'userId', flowid: 'flowId' }[key], req.headers[`x-ph-${key}`] || req.headers[key]])),
+              ...this.parsePlivoExtraHeaders(msg.start.extraHeaders || msg.start.extra_headers || msg.extraHeaders)
+            };
+            // Last resort: plivo-inbound / plivo-xml saved the call with its agent and user.
+            if (!customData.agentId && !customData.flowId && callSid) {
+              const knownCall = await Call.findOne({ twilio_call_sid: callSid }).lean();
+              if (knownCall) {
+                customData.agentId = knownCall.agent_id?.toString();
+                customData.flowId = knownCall.flow_id?.toString();
+                customData.userId = knownCall.user_id?.toString();
+              }
+            }
+          }
           flowId = customData.flowId && customData.flowId !== 'undefined' && customData.flowId !== 'null' ? customData.flowId : null;
           agentId = customData.agentId && customData.agentId !== 'undefined' && customData.agentId !== 'null' ? customData.agentId : null;
           userId = customData.userId && customData.userId !== 'undefined' && customData.userId !== 'null' ? customData.userId : null;

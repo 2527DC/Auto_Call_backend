@@ -362,6 +362,18 @@ exports.handlePlivoStatusCallback = async (req, res) => {
     if (isEnded) updateData.ended_at = new Date();
     if (RecordUrl) updateData.recording_url = RecordUrl;
 
+    let skipStatusEvents = false;
+    // Plivo's recording callback arrives after hangup still reporting
+    // CallStatus=in-progress; never move a finished call back to a live status.
+    if (updateData.status && !isEnded) {
+      const existing = await Call.findOne({ twilio_call_sid: { $in: [CallUUID, RequestUUID] } }).select('status').lean();
+      const finalStatuses = ['completed', 'failed', 'busy', 'no-answer', 'canceled', 'declined', 'missed'];
+      if (existing && finalStatuses.includes(existing.status)) {
+        delete updateData.status;
+        skipStatusEvents = true;
+      }
+    }
+
     let call = await Call.findOneAndUpdate(
       { twilio_call_sid: { $in: [CallUUID, RequestUUID] } },
       updateData,
@@ -373,7 +385,7 @@ exports.handlePlivoStatusCallback = async (req, res) => {
       await call.save();
     }
 
-    if (call && call.user_id) {
+    if (call && call.user_id && !skipStatusEvents) {
       if (CallStatus === 'completed') {
         webhookDispatcher.dispatchEvent(call.user_id, call.direction === 'inbound' ? 'Inbound Call Finished' : 'Call Finished', call);
       } else if (CallStatus === 'failed' || CallStatus === 'canceled') {

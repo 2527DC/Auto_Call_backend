@@ -206,24 +206,36 @@ exports.generateTwiML = async (req, res) => {
 
 // Plivo's <Stream> takes the WebSocket URL as its text and passes context as
 // "key=value;key=value" extraHeaders (it has no Twilio-style <Parameter> children).
-const buildPlivoStreamXml = ({ flowId, agentId, userId }) => {
+const buildPlivoStreamXml = ({ flowId, agentId, userId, record = false }) => {
   const appUrl = process.env.APP_URL.replace('http', 'ws');
   const headers = Object.entries({ flowId, agentId, userId })
     .filter(([, value]) => value && value !== 'undefined' && value !== 'null')
     .map(([key, value]) => `${key}=${value}`)
     .join(';');
 
+  // recordSession records the whole call in the background and moves straight
+  // on to the stream; Plivo posts RecordUrl to plivo-status when it is ready.
+  const recordXml = record
+    ? `<Record recordSession="true" redirect="false" maxLength="3600" fileFormat="mp3" callbackUrl="${process.env.APP_URL}/api/calls/plivo-status" callbackMethod="POST" />\n    `
+    : '';
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000" extraHeaders="${headers}">${appUrl}</Stream>
+    ${recordXml}<Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000" extraHeaders="${headers}">${appUrl}</Stream>
 </Response>`;
 };
 
 exports.generatePlivoXML = async (req, res) => {
   const { flowId, userId, agentId } = req.query;
 
+  let record = false;
+  if (agentId && db.mongoose.Types.ObjectId.isValid(agentId)) {
+    const agent = await Agent.findById(agentId).select('enable_call_recording').lean();
+    record = !!agent?.enable_call_recording;
+  }
+
   res.type('text/xml');
-  res.send(buildPlivoStreamXml({ flowId, agentId, userId }));
+  res.send(buildPlivoStreamXml({ flowId, agentId, userId, record }));
 };
 
 exports.handleStatusCallback = async (req, res) => {
@@ -889,7 +901,7 @@ exports.handlePlivoInboundCall = async (req, res) => {
     webhookDispatcher.dispatchEvent(userId, 'Inbound Call Arrived', callLog);
 
     res.type('text/xml');
-    res.send(buildPlivoStreamXml({ flowId, agentId, userId }));
+    res.send(buildPlivoStreamXml({ flowId, agentId, userId, record: !!agent.enable_call_recording }));
   } catch (error) {
     console.error('Plivo Inbound Call Error:', error);
     res.status(500).send('Internal Server Error');

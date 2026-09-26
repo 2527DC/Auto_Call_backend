@@ -140,9 +140,11 @@ exports.addNumbers = async (req, res) => {
 const buildSipTrunkConfigs = (trunk) => {
   const credentials = trunk.username ? { username: trunk.username, password: trunk.password } : null;
   return {
+    // The provider does not authenticate when it forwards incoming calls
+    // (Plivo inbound trunks send none), so ElevenLabs must not require it.
     inbound_trunk_config: {
       media_encryption: 'allowed',
-      credentials
+      credentials: null
     },
     outbound_trunk_config: {
       address: `${trunk.sip_host}:${trunk.port}`,

@@ -137,6 +137,22 @@ exports.addNumbers = async (req, res) => {
   }
 };
 
+const buildSipTrunkConfigs = (trunk) => {
+  const credentials = trunk.username ? { username: trunk.username, password: trunk.password } : null;
+  return {
+    inbound_trunk_config: {
+      media_encryption: 'allowed',
+      credentials
+    },
+    outbound_trunk_config: {
+      address: `${trunk.sip_host}:${trunk.port}`,
+      transport: trunk.transport || 'tls',
+      media_encryption: 'allowed',
+      credentials
+    }
+  };
+};
+
 exports.syncPhoneNumberToElevenLabs = async (req, res) => {
   try {
     const { id } = req.params;
@@ -151,16 +167,47 @@ exports.syncPhoneNumberToElevenLabs = async (req, res) => {
     }
 
     const settings = await UserSettings.findOne({ user: req.user.id });
-    if (!settings || !settings.twilio_account_sid || !settings.twilio_auth_token) {
-      return res.status(400).json({ success: false, message: 'Twilio credentials not configured in your settings' });
+    if (!settings || !settings.elevenlabs_api_key) {
+      return res.status(400).json({ success: false, message: 'ElevenLabs API key not configured in your settings' });
     }
 
-    const syncResult = await elevenlabsService.registerPhoneNumber({
-      phone_number: phoneNumber.phone_number,
-      label: `System Number ${phoneNumber.phone_number}`,
-      twilio_account_sid: settings.twilio_account_sid,
-      twilio_auth_token: settings.twilio_auth_token
-    }, settings.elevenlabs_api_key);
+    let syncResult;
+    if (phoneNumber.sip_trunk_id) {
+      // SIP numbers register through their trunk; Twilio credentials are not involved.
+      const trunk = await SipTrunk.findOne({ _id: phoneNumber.sip_trunk_id, user_id: req.user.id });
+      if (!trunk) {
+        return res.status(404).json({ success: false, message: 'SIP trunk for this phone number not found' });
+      }
+
+      syncResult = await elevenlabsService.importSipPhoneNumber({
+        phone_number: phoneNumber.phone_number,
+        label: phoneNumber.label || `SIP Number ${phoneNumber.phone_number}`,
+        ...buildSipTrunkConfigs(trunk)
+      }, settings.elevenlabs_api_key);
+    } else {
+      if (!settings.twilio_account_sid || !settings.twilio_auth_token) {
+        return res.status(400).json({ success: false, message: 'Twilio credentials not configured in your settings' });
+      }
+
+      syncResult = await elevenlabsService.registerPhoneNumber({
+        phone_number: phoneNumber.phone_number,
+        label: `System Number ${phoneNumber.phone_number}`,
+        twilio_account_sid: settings.twilio_account_sid,
+        twilio_auth_token: settings.twilio_auth_token
+      }, settings.elevenlabs_api_key);
+    }
+
+    // Numbers already assigned to an ElevenLabs agent get linked to it right away.
+    if (phoneNumber.agent_id) {
+      const agent = await Agent.findById(phoneNumber.agent_id);
+      if (agent && agent.elevenlabs_agent_id) {
+        await elevenlabsService.updateElevenLabsPhoneNumber(
+          syncResult.phone_number_id,
+          { agent_id: agent.elevenlabs_agent_id },
+          settings.elevenlabs_api_key
+        );
+      }
+    }
 
     phoneNumber.is_synced_to_elevenlabs = true;
     phoneNumber.elevenlabs_phone_number_id = syncResult.phone_number_id;
@@ -425,23 +472,10 @@ exports.importSipPhoneNumber = async (req, res) => {
     if (!settings || !settings.elevenlabs_api_key) {
       return res.status(400).json({ success: false, message: 'ElevenLabs API key not configured in your settings' });
     }
-    const inbound_trunk_config = {
-      media_encryption: 'allowed',
-      credentials: trunk.username ? { username: trunk.username, password: trunk.password } : null
-    };
-
-    const outbound_trunk_config = {
-      address: `${trunk.sip_host}:${trunk.port}`,
-      transport: trunk.transport || 'tls',
-      media_encryption: 'allowed',
-      credentials: trunk.username ? { username: trunk.username, password: trunk.password } : null
-    };
-
     const syncResult = await elevenlabsService.importSipPhoneNumber({
       phone_number,
       label: label || `SIP Number ${phone_number}`,
-      inbound_trunk_config,
-      outbound_trunk_config
+      ...buildSipTrunkConfigs(trunk)
     }, settings.elevenlabs_api_key);
 
     const phoneNumber = await PhoneNumber.create({

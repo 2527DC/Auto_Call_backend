@@ -388,11 +388,14 @@ class ElevenLabsService {
     }
   }
 
-  async transcribeAudio(audioBuffer, apiKey = null) {
+  async transcribeAudio(audioBuffer, apiKey = null, languageCode = null) {
     const activeApiKey = apiKey || this.apiKey;
     try {
       const formData = new FormData();
       formData.append('model_id', 'scribe_v2');
+      // Without a language, Scribe auto-detects per utterance and phone audio
+      // gets misread as other languages; pin it to the agent's language.
+      if (languageCode) formData.append('language_code', languageCode);
       formData.append('file', audioBuffer, { filename: 'speech.wav', contentType: 'audio/wav' });
 
       const response = await axios.post(

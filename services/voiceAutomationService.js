@@ -789,7 +789,7 @@ class VoiceAutomationService extends EventEmitter {
             systemPrompt += `\n\nADDITIONAL KNOWLEDGE BASE:\n${currentAgent.custom_knowledge_base}`;
           }
 
-          const nextResponse = await llmService.generateResponseWithSystemPrompt(
+          const rawResponse = await llmService.generateResponseWithSystemPrompt(
             fullPrompt,
             systemPrompt,
             aiConfig?.model || currentAgent.llm_model?.model_id,
@@ -801,6 +801,8 @@ class VoiceAutomationService extends EventEmitter {
               intelligence_level: currentAgent.intelligence_level
             }
           );
+          // The model sometimes labels its turn ("Assistant: ..."), which would be spoken aloud.
+          const nextResponse = (rawResponse || '').replace(/^\s*(assistant|agent|ai)\s*:\s*/i, '');
 
           if (nextResponse && nextResponse.trim()) {
             stream.conversationHistory.push({ role: 'assistant', text: nextResponse });
@@ -858,7 +860,8 @@ class VoiceAutomationService extends EventEmitter {
         const apiKey = userSettings?.elevenlabs_api_key;
         const wavBuffer = this.createUlawWav(buffer);
         await elevenLabsService.saveAudio(wavBuffer, `inbound_${Date.now()}.mp3`);
-        const text = await elevenLabsService.transcribeAudio(wavBuffer, apiKey);
+        const languageCode = agent?.language ? String(agent.language).split(/[-_]/)[0].toLowerCase() : null;
+        const text = await elevenLabsService.transcribeAudio(wavBuffer, apiKey, languageCode);
         const cleanedText = text ? text.trim() : '';
         if (!cleanedText || noiseTokens.some(token => cleanedText.toLowerCase().includes(token))) {
           console.log(`Ignoring noise/silence token: ${cleanedText}`);

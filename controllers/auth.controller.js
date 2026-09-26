@@ -18,6 +18,50 @@ const creditService = require('../services/creditService');
 const EmailDispatcher = require('../services/emailDispatcher');
 const crypto = require('crypto');
 
+const createRegisteredUser = async ({ name, email, hashedPassword, settings }) => {
+  const userRole = await Role.findOne({ name: 'user' });
+
+  const user = await User.create({
+    name,
+    email: email.toLowerCase().trim(),
+    password: hashedPassword,
+    roleId: userRole ? userRole._id : null
+  });
+
+  const freeCredits = settings.free_credits_on_registration || 0;
+  if (freeCredits > 0) {
+    await creditService.addCredits(
+      user._id,
+      freeCredits,
+      'registration_bonus',
+      'Free credits on registration',
+      null,
+      null
+    );
+  }
+
+  if (settings.is_demo_mode !== true) {
+    EmailDispatcher.dispatch(user.email, 'welcome-message', {
+      user_name: user.name,
+      user_email: user.email,
+      login_url: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/login`
+    }).catch(err => console.error('Error sending welcome email:', err));
+  }
+
+  return { user, freeCredits };
+};
+
+const registrationResponse = (user, freeCredits) => ({
+  message: 'User registered successfully.',
+  otp_required: false,
+  user: formatUser(user),
+  credits: freeCredits > 0 ? {
+    total_credits: freeCredits,
+    used_credits: 0,
+    available_credits: freeCredits
+  } : null
+});
+
 exports.register = async (req, res) => {
   const { name, email, password } = req.body;
   const ip = req.ip;
@@ -42,10 +86,16 @@ exports.register = async (req, res) => {
       return res.status(409).json({ message: 'User with this email already exists.' });
     }
 
+    const hashedPassword = await hashPassword(password);
+    const settings = await getSettings();
+
+    if (settings.registration_otp_required === false) {
+      const { user, freeCredits } = await createRegisteredUser({ name: name.trim(), email, hashedPassword, settings });
+      return res.status(201).json(registrationResponse(user, freeCredits));
+    }
+
     const otp = await generateOTP();
     const expires_at = new Date(Date.now() + 10 * 60 * 1000);
-
-    const hashedPassword = await hashPassword(password);
 
     await OTPLog.create({
       email: email.toLowerCase().trim(),
@@ -58,8 +108,6 @@ exports.register = async (req, res) => {
       }
     });
 
-    const settings = await getSettings();
-
     if (settings.is_demo_mode !== true) {
       await EmailDispatcher.dispatch(email.toLowerCase().trim(), 'registration-otp', {
         user_name: name.trim(),
@@ -69,6 +117,7 @@ exports.register = async (req, res) => {
 
     return res.status(200).json({
       message: `Verification OTP sent successfully to ${email}`,
+      otp_required: true,
       demo_otp: settings.is_demo_mode ? '123456' : null
     });
   } catch (err) {
@@ -127,46 +176,16 @@ exports.verifyRegistration = async (req, res) => {
       return res.status(409).json({ message: 'User with this email already exists.' });
     }
 
-    const userRole = await Role.findOne({ name: 'user' });
-
-    const user = await User.create({
+    const { user, freeCredits } = await createRegisteredUser({
       name: metadata.name,
-      email: email.toLowerCase().trim(),
-      password: metadata.password,
-      roleId: userRole ? userRole._id : null
+      email,
+      hashedPassword: metadata.password,
+      settings
     });
-
-    const freeCredits = settings.free_credits_on_registration || 0;
-    if (freeCredits > 0) {
-      await creditService.addCredits(
-        user._id,
-        freeCredits,
-        'registration_bonus',
-        'Free credits on registration',
-        null,
-        null
-      );
-    }
 
     await otpRecord.updateOne({ verified: true });
 
-    if (settings.is_demo_mode !== true) {
-      EmailDispatcher.dispatch(user.email, 'welcome-message', {
-        user_name: user.name,
-        user_email: user.email,
-        login_url: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/login`
-      }).catch(err => console.error('Error sending welcome email:', err));
-    }
-
-    return res.status(201).json({
-      message: 'User registered successfully.',
-      user: formatUser(user),
-      credits: freeCredits > 0 ? {
-        total_credits: freeCredits,
-        used_credits: 0,
-        available_credits: freeCredits
-      } : null
-    });
+    return res.status(201).json(registrationResponse(user, freeCredits));
   } catch (err) {
     if (err.message === 'MAINTENANCE_MODE') {
       const settings = await getSettings();

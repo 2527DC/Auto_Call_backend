@@ -99,7 +99,7 @@ exports.updateSettings = async (req, res) => {
     const demoFields = ['demo_user_email', 'demo_user_password', 'is_demo_mode'];
     const widgetFields = ['login_widget_key'];
     const creditFields = ['credit_deduction_type', 'credits_per_call', 'credits_per_minute', 'free_credits_on_registration', 'credits_per_sms'];
-    const agreementFields = ['signup_agreement_enabled', 'signup_agreement_prefix_text', 'signup_agreement_link_text', 'signup_agreement_target_page'];
+    const agreementFields = ['registration_otp_required', 'signup_agreement_enabled', 'signup_agreement_prefix_text', 'signup_agreement_link_text', 'signup_agreement_target_page'];
     const kycFields = ['kyc_allow_pdf_upload', 'kyc_required', 'kyc_max_files', 'kyc_form_fields'];
 
     const allFields = [
@@ -207,6 +207,10 @@ exports.updateSettings = async (req, res) => {
 
     if (updateData.restore_storage_on_delete !== undefined) {
       updateData.restore_storage_on_delete = updateData.restore_storage_on_delete === 'true' || updateData.restore_storage_on_delete === true || updateData.restore_storage_on_delete === '1' || updateData.restore_storage_on_delete === 1;
+    }
+
+    if (updateData.registration_otp_required !== undefined) {
+      updateData.registration_otp_required = updateData.registration_otp_required === 'true' || updateData.registration_otp_required === true || updateData.registration_otp_required === '1' || updateData.registration_otp_required === 1;
     }
 
     if (updateData.signup_agreement_enabled !== undefined) {
@@ -321,6 +325,7 @@ exports.getPublicSettings = async (req, res) => {
       'no_internet_title',
       'no_internet_content',
       'login_widget_key',
+      'registration_otp_required',
       'signup_agreement_enabled',
       'signup_agreement_prefix_text',
       'signup_agreement_link_text',

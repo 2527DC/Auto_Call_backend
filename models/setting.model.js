@@ -328,6 +328,12 @@ const SettingSchema = new Schema(
       type: Boolean,
       default: false
     },
+    // When false, sign-up creates the account immediately without an email OTP
+    // (useful before SMTP is configured).
+    registration_otp_required: {
+      type: Boolean,
+      default: true
+    },
     signup_agreement_prefix_text: {
       type: String,
       default: 'I agree to the'

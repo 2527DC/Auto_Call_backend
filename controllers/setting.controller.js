@@ -209,6 +209,11 @@ exports.updateSettings = async (req, res) => {
       updateData.restore_storage_on_delete = updateData.restore_storage_on_delete === 'true' || updateData.restore_storage_on_delete === true || updateData.restore_storage_on_delete === '1' || updateData.restore_storage_on_delete === 1;
     }
 
+    // "No page selected" arrives as "" from the form; the field stores a page id.
+    if (updateData.signup_agreement_target_page === '' || updateData.signup_agreement_target_page === 'null') {
+      updateData.signup_agreement_target_page = null;
+    }
+
     if (updateData.registration_otp_required !== undefined) {
       updateData.registration_otp_required = updateData.registration_otp_required === 'true' || updateData.registration_otp_required === true || updateData.registration_otp_required === '1' || updateData.registration_otp_required === 1;
     }

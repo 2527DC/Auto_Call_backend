@@ -345,16 +345,29 @@ exports.handleStatusCallback = async (req, res) => {
 };
 
 exports.handlePlivoStatusCallback = async (req, res) => {
-  const { CallUUID, RequestUUID, CallStatus, Duration, RecordUrl } = req.body;
+  const { CallUUID, RequestUUID, CallStatus, Duration, RecordUrl, Event, HangupCause } = req.body;
   try {
     let mappedCallStatus = CallStatus;
     if (CallStatus === 'busy') mappedCallStatus = 'declined';
     if (CallStatus === 'no-answer') mappedCallStatus = 'missed';
 
-    const isEnded = ['completed', 'failed', 'busy', 'no-answer', 'canceled', 'declined', 'missed'].includes(CallStatus) || ['declined', 'missed'].includes(mappedCallStatus);
+    // Handle Plivo Hangup event or cause if CallStatus is in-progress or missing
+    if (Event === 'Hangup' || HangupCause) {
+      if (!mappedCallStatus || mappedCallStatus === 'in-progress') {
+        if (HangupCause === 'USER_BUSY' || HangupCause === 'REJECTED') {
+          mappedCallStatus = 'declined';
+        } else if (HangupCause === 'NO_ANSWER') {
+          mappedCallStatus = 'missed';
+        } else {
+          mappedCallStatus = 'completed';
+        }
+      }
+    }
+
+    const isEnded = ['completed', 'failed', 'busy', 'no-answer', 'canceled', 'declined', 'missed'].includes(mappedCallStatus) || ['completed', 'failed', 'busy', 'no-answer', 'canceled', 'declined', 'missed'].includes(CallStatus);
 
     const updateData = {};
-    if (CallStatus) updateData.status = mappedCallStatus;
+    if (mappedCallStatus) updateData.status = mappedCallStatus;
     if (Duration) updateData.duration = Number(Duration);
     if (isEnded) updateData.ended_at = new Date();
     if (RecordUrl) updateData.recording_url = RecordUrl;
@@ -382,18 +395,26 @@ exports.handlePlivoStatusCallback = async (req, res) => {
       await call.save();
     }
 
+    if (call && call.user_id && req.app.get('io')) {
+      req.app.get('io').emit(`call-status-update-${call.user_id}`, {
+        callSid: call.twilio_call_sid || CallUUID || RequestUUID,
+        status: mappedCallStatus || call.status
+      });
+    }
+
     if (call && call.user_id && !skipStatusEvents) {
-      if (CallStatus === 'completed') {
+      const effectiveStatus = mappedCallStatus || CallStatus;
+      if (effectiveStatus === 'completed') {
         webhookDispatcher.dispatchEvent(call.user_id, call.direction === 'inbound' ? 'Inbound Call Finished' : 'Call Finished', call);
-      } else if (CallStatus === 'failed' || CallStatus === 'canceled') {
+      } else if (effectiveStatus === 'failed' || effectiveStatus === 'canceled') {
         webhookDispatcher.dispatchEvent(call.user_id, call.direction === 'inbound' ? 'Inbound Call Unanswered' : 'Call Errored', call);
-      } else if (CallStatus === 'busy') {
+      } else if (effectiveStatus === 'busy' || effectiveStatus === 'declined') {
         webhookDispatcher.dispatchEvent(call.user_id, 'Number Busy', call);
-      } else if (CallStatus === 'no-answer') {
+      } else if (effectiveStatus === 'no-answer' || effectiveStatus === 'missed') {
         webhookDispatcher.dispatchEvent(call.user_id, call.direction === 'inbound' ? 'Inbound Call Unanswered' : 'Unanswered', call);
-      } else if (CallStatus === 'ringing') {
+      } else if (effectiveStatus === 'ringing') {
         webhookDispatcher.dispatchEvent(call.user_id, 'Call Ringing', call);
-      } else if (CallStatus === 'in-progress') {
+      } else if (effectiveStatus === 'in-progress') {
         webhookDispatcher.dispatchEvent(call.user_id, call.direction === 'inbound' ? 'Inbound Call Handled' : 'Call Picked Up', call);
       }
     }
@@ -403,7 +424,7 @@ exports.handlePlivoStatusCallback = async (req, res) => {
       await call.save();
     }
 
-    if (call && CallStatus === 'completed' && call.user_id) {
+    if (call && (CallStatus === 'completed' || mappedCallStatus === 'completed') && call.user_id) {
       try {
         const callDuration = call.duration || 0;
         const creditResult = await creditService.processCallCreditDeduction(
@@ -420,10 +441,11 @@ exports.handlePlivoStatusCallback = async (req, res) => {
 
     if (call && call.campaign_id && isEnded) {
       let executionStatus = 'PENDING';
-      if (CallStatus === 'completed') executionStatus = 'CONTACT SUCCESSFUL';
-      else if (CallStatus === 'failed' || CallStatus === 'no-answer') executionStatus = 'CALL FAILED';
-      else if (CallStatus === 'busy') executionStatus = 'LINE BUSY';
-      else if (CallStatus === 'canceled') executionStatus = 'CANCELED';
+      const effectiveStatus = mappedCallStatus || CallStatus;
+      if (effectiveStatus === 'completed') executionStatus = 'CONTACT SUCCESSFUL';
+      else if (effectiveStatus === 'failed' || effectiveStatus === 'no-answer' || effectiveStatus === 'missed') executionStatus = 'CALL FAILED';
+      else if (effectiveStatus === 'busy' || effectiveStatus === 'declined') executionStatus = 'LINE BUSY';
+      else if (effectiveStatus === 'canceled') executionStatus = 'CANCELED';
 
       if (CampaignHistory) {
         await CampaignHistory.findOneAndUpdate(

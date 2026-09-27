@@ -33,6 +33,8 @@ class PlivoService {
       };
 
       if (statusCallbackUrl) {
+        callOptions.hangupUrl = statusCallbackUrl;
+        callOptions.hangupMethod = 'POST';
         callOptions.fallbackUrl = statusCallbackUrl;
         callOptions.fallbackMethod = 'POST';
       }

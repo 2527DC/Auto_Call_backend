@@ -128,10 +128,72 @@ class VoiceAutomationService extends EventEmitter {
     }, stream.playbackEndsAt - now + 300);
   }
 
+  setIo(io) {
+    this.io = io;
+  }
+
+  async handleStreamCallCompletion(callSid, userId) {
+    try {
+      if (!callSid) return;
+      const call = await Call.findOne({ twilio_call_sid: callSid });
+      if (!call) return;
+
+      const finalStatuses = ['completed', 'failed', 'busy', 'no-answer', 'canceled', 'declined', 'missed'];
+      if (finalStatuses.includes(call.status)) return;
+
+      const now = new Date();
+      call.status = 'completed';
+      call.ended_at = now;
+      if (call.started_at) {
+        call.duration = Math.max(1, Math.round((now.getTime() - new Date(call.started_at).getTime()) / 1000));
+      } else {
+        call.started_at = now;
+        call.duration = 1;
+      }
+      await call.save();
+      console.log(`[Stream Closed] Call ${callSid} status updated to completed. Duration: ${call.duration}s`);
+
+      // Realtime notification to frontend
+      if (userId && this.io) {
+        this.io.emit(`call-status-update-${userId}`, {
+          callSid: call.twilio_call_sid,
+          status: 'completed'
+        });
+      }
+
+      // Process credit deduction
+      try {
+        const creditService = require('./creditService');
+        const creditResult = await creditService.processCallCreditDeduction(
+          call.user_id,
+          call._id,
+          call.duration || 0
+        );
+        if (creditResult && creditResult.credits_deducted !== undefined) {
+          call.credits_used = creditResult.credits_deducted;
+          await call.save();
+        }
+      } catch (cErr) {
+        console.error('[Stream Closed] Credit deduction error:', cErr.message);
+      }
+
+      // Webhook event
+      try {
+        const webhookDispatcher = require('./webhookDispatcher');
+        webhookDispatcher.dispatchEvent(call.user_id, call.direction === 'inbound' ? 'Inbound Call Finished' : 'Call Finished', call);
+      } catch (wErr) {
+        console.error('[Stream Closed] Webhook error:', wErr.message);
+      }
+    } catch (err) {
+      console.error('[Stream Closed] Error completing call on stream close:', err.message);
+    }
+  }
+
   endStream(streamSid) {
     const closingStream = this.activeStreams.get(streamSid);
     if (!closingStream) return;
     if (closingStream.callSid) {
+      this.handleStreamCallCompletion(closingStream.callSid, closingStream.userId);
       this.handlePostCallIntegrations(closingStream.callSid, closingStream.userId);
       this.plivoCallIds.delete(closingStream.callSid);
     }

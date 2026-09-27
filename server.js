@@ -39,6 +39,7 @@ const PORT = process.env.PORT || 3000;
     const { WebSocketServer } = require('ws');
     const wss = new WebSocketServer({ server, path: '/' });
     const voiceAutomationService = require('./services/voiceAutomationService');
+    voiceAutomationService.setIo(io);
 
     wss.on('connection', (ws, req) => {
       console.log('Media Stream WebSocket connected');

@@ -237,9 +237,8 @@ if (process.env.REDIS_URL) {
               await new Promise(resolve => setTimeout(resolve, 3000));
               console.log(`WhatsApp Call to ${to} initiated with ID: ${callSid}`);
               successCount++;
-            } else if (phoneNumberDoc.type === 'sip' && phoneNumberDoc.elevenlabs_phone_number_id) {
+            } else if (phoneNumberDoc.type === 'sip' && phoneNumberDoc.elevenlabs_phone_number_id && agent.elevenlabs_agent_id) {
               if (!settings.elevenlabs_api_key) throw new Error('ElevenLabs API key not configured for SIP calling');
-              if (!agent.elevenlabs_agent_id) throw new Error('Selected agent is not configured for ElevenLabs SIP calling');
 
               const sipResponse = await elevenLabsService.makeSipOutboundCall(
                 agent.elevenlabs_agent_id,
@@ -266,7 +265,7 @@ if (process.env.REDIS_URL) {
               await new Promise(resolve => setTimeout(resolve, 3000));
               console.log(`SIP Call to ${to} initiated with ID: ${callSid}`);
               successCount++;
-            } else if (phoneNumberDoc.provider === 'plivo') {
+            } else if (phoneNumberDoc.provider === 'plivo' || phoneNumberDoc.type === 'sip') {
               if (!settings.plivo_auth_id || !settings.plivo_auth_token) {
                 throw new Error('Plivo credentials not found for this user');
               }

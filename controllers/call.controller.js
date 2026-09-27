@@ -69,12 +69,9 @@ exports.placeCall = async (req, res) => {
 
     let callLog;
 
-    if (sourceNumber.type === 'sip' && sourceNumber.elevenlabs_phone_number_id) {
+    if (sourceNumber.type === 'sip' && sourceNumber.elevenlabs_phone_number_id && agent.elevenlabs_agent_id) {
       if (!settings.elevenlabs_api_key) {
         return res.status(400).json({ success: false, message: 'ElevenLabs API key not configured' });
-      }
-      if (!agent.elevenlabs_agent_id) {
-        return res.status(400).json({ success: false, message: 'Selected agent is not configured for ElevenLabs SIP calling' });
       }
 
       const sipResponse = await elevenLabsService.makeSipOutboundCall(
@@ -96,7 +93,7 @@ exports.placeCall = async (req, res) => {
         contact_id: contact ? contact._id : null
       });
       webhookDispatcher.dispatchEvent(userId, 'Call Initiated', callLog);
-    } else if (sourceNumber.provider === 'plivo') {
+    } else if (sourceNumber.provider === 'plivo' || sourceNumber.type === 'sip') {
       const authId = settings.plivo_auth_id || process.env.PLIVO_AUTH_ID;
       const authToken = settings.plivo_auth_token || process.env.PLIVO_AUTH_TOKEN;
       if (!authId || !authToken) {

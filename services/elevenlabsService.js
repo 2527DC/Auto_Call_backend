@@ -167,6 +167,24 @@ class ElevenLabsService {
     }
   }
 
+  async listPhoneNumbers(apiKey = null) {
+    const activeApiKey = apiKey || this.apiKey;
+    if (!activeApiKey) return [];
+    try {
+      const response = await axios({
+        method: 'GET',
+        url: `${this.baseUrl}/convai/phone-numbers`,
+        headers: {
+          'xi-api-key': activeApiKey
+        }
+      });
+      return response.data || [];
+    } catch (error) {
+      console.error('ElevenLabs List Phone Numbers Error:', error.response?.data || error.message);
+      return [];
+    }
+  }
+
   async registerPhoneNumber(data, apiKey = null) {
     const activeApiKey = apiKey || this.apiKey;
     try {
@@ -187,9 +205,34 @@ class ElevenLabsService {
       });
       return response.data;
     } catch (error) {
-      const errorMessage = error.response ?
-        JSON.stringify(error.response.data) :
+      const errorData = error.response?.data;
+      const errorMessage = errorData ?
+        JSON.stringify(errorData) :
         error.message;
+
+      const isAlreadyExists =
+        error.response?.status === 409 ||
+        errorData?.detail?.code === 'resource_already_exists' ||
+        errorData?.detail?.type === 'conflict' ||
+        errorData?.detail?.status === 'phone_number_conflict' ||
+        errorMessage.includes('already exists');
+
+      if (isAlreadyExists) {
+        console.log(`[ElevenLabs] Phone number ${data.phone_number} already exists in ElevenLabs. Resolving existing ID...`);
+        const phoneList = await this.listPhoneNumbers(activeApiKey);
+        const normalizedTarget = (data.phone_number || '').replace(/[^\d+]/g, '');
+        const matched = (phoneList || []).find(p => (p.phone_number || '').replace(/[^\d+]/g, '') === normalizedTarget);
+
+        if (matched && matched.phone_number_id) {
+          console.log(`[ElevenLabs] Mapped to existing phone_number_id: ${matched.phone_number_id}`);
+          return {
+            ...matched,
+            phone_number_id: matched.phone_number_id,
+            already_existed: true
+          };
+        }
+      }
+
       console.error('ElevenLabs Phone Register Error:', errorMessage);
       throw new Error(`ElevenLabs Phone Registration Failed: ${errorMessage}`);
     }
@@ -215,9 +258,45 @@ class ElevenLabsService {
       });
       return response.data;
     } catch (error) {
-      const errorMessage = error.response ?
-        JSON.stringify(error.response.data) :
+      const errorData = error.response?.data;
+      const errorMessage = errorData ?
+        JSON.stringify(errorData) :
         error.message;
+
+      const isAlreadyExists =
+        error.response?.status === 409 ||
+        errorData?.detail?.code === 'resource_already_exists' ||
+        errorData?.detail?.type === 'conflict' ||
+        errorData?.detail?.status === 'phone_number_conflict' ||
+        errorMessage.includes('already exists');
+
+      if (isAlreadyExists) {
+        console.log(`[ElevenLabs] Phone number ${data.phone_number} already exists in ElevenLabs. Resolving existing ID...`);
+        const phoneList = await this.listPhoneNumbers(activeApiKey);
+        const normalizedTarget = (data.phone_number || '').replace(/[^\d+]/g, '');
+        const matched = (phoneList || []).find(p => (p.phone_number || '').replace(/[^\d+]/g, '') === normalizedTarget);
+
+        if (matched && matched.phone_number_id) {
+          console.log(`[ElevenLabs] Mapped to existing ElevenLabs phone_number_id: ${matched.phone_number_id}`);
+          if (data.inbound_trunk_config || data.outbound_trunk_config) {
+            try {
+              await this.updateElevenLabsPhoneNumber(matched.phone_number_id, {
+                label: data.label || matched.label,
+                inbound_trunk_config: data.inbound_trunk_config,
+                outbound_trunk_config: data.outbound_trunk_config
+              }, activeApiKey);
+            } catch (patchErr) {
+              console.warn('[ElevenLabs] Warning updating existing phone config:', patchErr.message);
+            }
+          }
+          return {
+            ...matched,
+            phone_number_id: matched.phone_number_id,
+            already_existed: true
+          };
+        }
+      }
+
       console.error('ElevenLabs SIP Phone Import Error:', errorMessage);
       throw new Error(`ElevenLabs SIP Phone Import Failed: ${errorMessage}`);
     }

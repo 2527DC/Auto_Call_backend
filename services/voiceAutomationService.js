@@ -98,6 +98,9 @@ class VoiceAutomationService extends EventEmitter {
   // Sends one synthesized utterance (8 kHz mu-law, base64) and signals when playback ends.
   sendAgentAudio(ws, streamSid, base64Audio) {
     const stream = this.activeStreams.get(streamSid);
+    // Caller audio is ignored until this utterance has finished playing
+    // (see handlePlaybackComplete), so the agent never answers its own echo.
+    if (stream) stream.pendingPlaybacks = (stream.pendingPlaybacks || 0) + 1;
 
     if (stream?.provider !== 'plivo') {
       ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: base64Audio } }));
@@ -201,8 +204,25 @@ class VoiceAutomationService extends EventEmitter {
     console.log(`Stream stopped: ${streamSid}`);
   }
 
+  // True while the agent is thinking or talking; caller audio is dropped then.
+  isAgentTurn(stream) {
+    return stream.processingTurn || stream.pendingPlaybacks > 0 || Date.now() < (stream.listenAfter || 0);
+  }
+
   async handlePlaybackComplete(streamSid) {
     const streamForMark = this.activeStreams.get(streamSid);
+    if (streamForMark && streamForMark.pendingPlaybacks > 0) {
+      streamForMark.pendingPlaybacks--;
+      if (streamForMark.pendingPlaybacks === 0) {
+        // Short grace period so the tail of the agent's own voice is not captured.
+        streamForMark.listenAfter = Date.now() + 300;
+        streamForMark.audioBuffer = [];
+        streamForMark.isSpeaking = false;
+        streamForMark.silenceMs = 0;
+        streamForMark.speechMs = 0;
+        console.log(`[Turn] Agent finished speaking, listening to caller (${streamSid})`);
+      }
+    }
     if (streamForMark && streamForMark.pendingTransfer) {
       console.log(`[Flow] Speech completed, executing pending transfer to: ${streamForMark.pendingTransfer}`);
       const client = await this.getCallControlClient(streamForMark.userId);
@@ -282,19 +302,36 @@ class VoiceAutomationService extends EventEmitter {
             lastProcessedAt: Date.now(),
             currentNodeId: null,
             isSpeaking: false,
-            silenceCount: 0,
+            silenceMs: 0,
+            speechMs: 0,
+            // Hold the caller's audio until the greeting has been played.
+            processingTurn: true,
+            pendingPlaybacks: 0,
             conversationHistory: [],
             callStartTime: Date.now()
           });
 
           console.log(`Stream started: CallSid=${callSid}, FlowId=${flowId}, AgentId=${agentId}, UserId=${userId}`);
+          const startedAt = Date.now();
           try {
-            const callLog = await Call.findOne({ twilio_call_sid: callSid });
-            const userSettings = (userId && db.mongoose.Types.ObjectId.isValid(userId)) ? await UserSettings.findOne({ user: userId }).populate('ai_model') : null;
+            const isValidId = (id) => id && db.mongoose.Types.ObjectId.isValid(id);
+            const hasFlow = isValidId(flowId);
+            // Independent lookups run together; each Atlas round trip adds to the silence before the greeting.
+            const [callLog, userSettings, flow, flowAgent] = await Promise.all([
+              Call.findOne({ twilio_call_sid: callSid }),
+              isValidId(userId) ? UserSettings.findOne({ user: userId }).populate('ai_model') : null,
+              hasFlow ? Flow.findById(flowId) : null,
+              hasFlow ? Agent.findOne({ flow_id: flowId }).populate('llm_model', 'model_id provider name') : null
+            ]);
+            const startStream = this.activeStreams.get(streamSid);
+            if (startStream) {
+              startStream.agent = hasFlow ? flowAgent : null;
+              startStream.userSettings = userSettings;
+            }
+            console.log(`[Timing] Stream setup lookups took ${Date.now() - startedAt}ms`);
 
-            if (flowId && db.mongoose.Types.ObjectId.isValid(flowId)) {
-              const flow = await Flow.findById(flowId);
-              const agent = await Agent.findOne({ flow_id: flowId }).populate('llm_model', 'model_id provider name');
+            if (hasFlow) {
+              const agent = flowAgent;
 
               if (flow && callLog) {
                 const aiConfig = userSettings?.ai_model ? {
@@ -441,10 +478,11 @@ class VoiceAutomationService extends EventEmitter {
               }
             } else if (agentId && db.mongoose.Types.ObjectId.isValid(agentId)) {
               const agent = await Agent.findById(agentId).populate('llm_model', 'model_id provider name');
+              const stream = this.activeStreams.get(streamSid);
+              if (stream) stream.agent = agent;
 
               if (agent && callLog) {
                 const greeting = agent.first_message || `Hello! I'm ${agent.name}. How can I help you today?`;
-                const stream = this.activeStreams.get(streamSid);
                 if (stream) {
                   stream.conversationHistory = [
                     { role: 'assistant', text: greeting }
@@ -453,52 +491,74 @@ class VoiceAutomationService extends EventEmitter {
                 if (agent?.enable_call_transcription) {
                   callLog.transcript.push({ role: 'agent', text: greeting });
                 }
-                await callLog.save();
                 await this.speak(ws, streamSid, greeting, agent.voice_id, userSettings?.elevenlabs_api_key);
+                await callLog.save();
               }
             }
           } catch (err) {
             console.error('Error starting stream:', err);
+          } finally {
+            const startStream = this.activeStreams.get(streamSid);
+            if (startStream) startStream.processingTurn = false;
+            console.log(`[Timing] Greeting sent ${Date.now() - startedAt}ms after stream start`);
           }
           break;
 
         case 'media':
           const stream = this.activeStreams.get(streamSid);
           if (stream) {
+            // Half-duplex: while the agent is thinking or talking, drop caller
+            // audio so its own voice (echo) or an early "hello?" is not taken as an answer.
+            if (this.isAgentTurn(stream)) {
+              if (stream.audioBuffer.length) {
+                stream.audioBuffer = [];
+                stream.isSpeaking = false;
+                stream.silenceMs = 0;
+                stream.speechMs = 0;
+              }
+              break;
+            }
+
             const chunk = Buffer.from(msg.media.payload, 'base64');
             const rms = this.calculateUlawRMS(chunk);
+            const chunkMs = chunk.length / 8; // 8 kHz mu-law = 8 bytes per ms
 
             const SPEECH_THRESHOLD = 800;
-            const SILENCE_THRESHOLD = 500;
+            const MIN_SPEECH_MS = 200;     // ignore clicks and short noise bursts
+            const END_OF_TURN_SILENCE_MS = 1300;
+            const MAX_UTTERANCE_MS = 30000; // long interview answers
+            const PRE_ROLL_MS = 400;
 
             if (rms > SPEECH_THRESHOLD) {
               stream.isSpeaking = true;
-              stream.silenceCount = 0;
+              stream.silenceMs = 0;
+              stream.speechMs = (stream.speechMs || 0) + chunkMs;
             } else if (stream.isSpeaking) {
-              stream.silenceCount++;
+              stream.silenceMs = (stream.silenceMs || 0) + chunkMs;
             }
 
             stream.audioBuffer.push(chunk);
 
-            if (!stream.isSpeaking && stream.audioBuffer.length > 20) {
-              stream.audioBuffer.shift();
+            if (!stream.isSpeaking) {
+              let bufferedMs = stream.audioBuffer.reduce((ms, c) => ms + c.length / 8, 0);
+              while (bufferedMs > PRE_ROLL_MS && stream.audioBuffer.length > 1) {
+                bufferedMs -= stream.audioBuffer.shift().length / 8;
+              }
+              break;
             }
 
-            if (stream.isSpeaking && stream.silenceCount >= 60) {
-              const fullBuffer = Buffer.concat(stream.audioBuffer);
-              stream.audioBuffer = [];
-              stream.isSpeaking = false;
-              stream.silenceCount = 0;
+            const utteranceMs = stream.audioBuffer.reduce((ms, c) => ms + c.length / 8, 0);
+            const endOfTurn = stream.silenceMs >= END_OF_TURN_SILENCE_MS || utteranceMs >= MAX_UTTERANCE_MS;
+            if (!endOfTurn) break;
 
-              this.handleCompleteSpeech(streamSid, ws, fullBuffer).catch(err => console.error(err));
-            }
+            const fullBuffer = Buffer.concat(stream.audioBuffer);
+            const wasRealSpeech = stream.speechMs >= MIN_SPEECH_MS;
+            stream.audioBuffer = [];
+            stream.isSpeaking = false;
+            stream.silenceMs = 0;
+            stream.speechMs = 0;
 
-            if (stream.audioBuffer.length >= 750) {
-              const fullBuffer = Buffer.concat(stream.audioBuffer);
-              stream.audioBuffer = [];
-              stream.isSpeaking = false;
-              stream.silenceCount = 0;
-
+            if (wasRealSpeech) {
               this.handleCompleteSpeech(streamSid, ws, fullBuffer).catch(err => console.error(err));
             }
           }
@@ -525,10 +585,22 @@ class VoiceAutomationService extends EventEmitter {
     });
   }
 
+  // One caller turn at a time: the next utterance is not heard until this
+  // one has been answered and the answer has finished playing.
   async handleCompleteSpeech(streamSid, ws, audioBuffer) {
     const stream = this.activeStreams.get(streamSid);
-    if (!stream) return;
+    if (!stream || stream.processingTurn) return;
+    stream.processingTurn = true;
+    const turnStartedAt = Date.now();
+    try {
+      await this.processCallerTurn(stream, streamSid, ws, audioBuffer);
+    } finally {
+      stream.processingTurn = false;
+      console.log(`[Timing] Caller turn handled in ${Date.now() - turnStartedAt}ms`);
+    }
+  }
 
+  async processCallerTurn(stream, streamSid, ws, audioBuffer) {
     const text = await this.processSTT(audioBuffer, stream.userId, stream.agentId, stream.flowId);
     if (!text || !text.trim()) return;
 
@@ -570,8 +642,10 @@ class VoiceAutomationService extends EventEmitter {
       }
     }
 
-    const hangupKeywords = ['hang up', 'cut the call', 'goodbye', 'bye', 'end the call', 'stop the call', '[phone hangs up]', '[phone hanging up]', '[phone clicks]', 'cut', 'stop', 'hangup'];
-    const isHangup = hangupKeywords.some(k => text.toLowerCase().includes(k.toLowerCase()));
+    // Whole words only: substring matching hung up on answers containing
+    // "execute" (cut), "stopped" (stop) or "bypass" (bye).
+    const hangupPattern = /\b(hang ?up|cut the call|end the call|stop the call|goodbye|bye)\b|\[phone (hangs up|hanging up|clicks)\]/i;
+    const isHangup = hangupPattern.test(text);
 
     if (currentAgentForChecks) {
       if (currentAgentForChecks.transfer_to_human?.enabled && currentAgentForChecks.transfer_to_human?.transfer_keywords?.length > 0) {
@@ -699,7 +773,7 @@ class VoiceAutomationService extends EventEmitter {
       } else if (stream.flowId) {
         const agent = await Agent.findOne({ flow_id: stream.flowId });
         if (!agent || agent?.enable_call_transcription !== false) {
-          if (currentAgent?.enable_call_transcription) {
+          if (agent?.enable_call_transcription) {
             currentCallLog.transcript.push({ role: 'user', text: text });
           }
         }
@@ -947,9 +1021,9 @@ class VoiceAutomationService extends EventEmitter {
       let activeVoiceId = voiceId;
 
       if (stream && (!provider || provider === 'elevenlabs')) {
-        let agent = null;
-        if (stream.agentId) agent = await Agent.findById(stream.agentId);
-        else if (stream.flowId) agent = await Agent.findOne({ flow_id: stream.flowId });
+        let agent = stream.agent || null;
+        if (!agent && stream.agentId) agent = await Agent.findById(stream.agentId);
+        else if (!agent && stream.flowId) agent = await Agent.findOne({ flow_id: stream.flowId });
         if (agent) {
           if (agent.voice_provider === 'deepgram' || agent.telephony_provider?.startsWith('deepgram')) {
             activeProvider = 'deepgram';
@@ -964,7 +1038,7 @@ class VoiceAutomationService extends EventEmitter {
         }
       }
 
-      const settings = stream?.userId ? await UserSettings.findOne({ user: stream.userId }) : null;
+      const settings = stream?.userSettings || (stream?.userId ? await UserSettings.findOne({ user: stream.userId }) : null);
 
       if (activeProvider === 'deepgram') {
         let dgApiKey = deepgramApiKey || settings?.deepgram_api_key || deepgramService.apiKey;

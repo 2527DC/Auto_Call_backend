@@ -57,10 +57,23 @@ class AutomationEngine {
     const startTime = Date.now();
     let steps = 0;
     const maxSteps = 50;
+    // One caller utterance answers one question. Once a capture node has used
+    // it, later capture nodes in this run must ask their own question and wait
+    // instead of re-reading the same answer.
+    const captureNodes = ['input_capture', 'data_capture', 'book_slot', 'email_notice'];
+    let inputConsumed = false;
+    let lastSpokenMessage = null;
 
     while (currentNode && steps < maxSteps) {
       steps++;
-      const nodeResult = await this.executeNode(currentNode, currentData);
+      const isCapture = captureNodes.includes(currentNode.type);
+      const nodeData = isCapture && inputConsumed ? { ...currentData, user_input: null } : currentData;
+      const nodeResult = await this.executeNode(currentNode, nodeData, {
+        hasNext: flow.edges.some(e => e.source === currentNode.id),
+        previousMessage: lastSpokenMessage
+      });
+      if (isCapture && nodeData.user_input) inputConsumed = true;
+      if (nodeResult.output?.last_message) lastSpokenMessage = nodeResult.output.last_message;
 
       executionLog.push({
         node_id: currentNode.id,
@@ -126,13 +139,13 @@ class AutomationEngine {
     };
   }
 
-  async executeNode(node, data) {
+  async executeNode(node, data, context = {}) {
     const handler = this.nodeHandlers[node.type];
     if (!handler) {
       return { success: true, output: {}, error: `No handler for node type: ${node.type}` };
     }
     try {
-      return await handler(node, data);
+      return await handler(node, data, context);
     } catch (error) {
       return { success: false, output: {}, error: error.message };
     }
@@ -151,9 +164,19 @@ class AutomationEngine {
     return { success: true, output: { last_message: msg, description: msg } };
   }
 
-  async executeInputCapture(node, data) {
+  async executeInputCapture(node, data, context = {}) {
     const promptMsg = node.data.description || node.data.text;
     if (data.user_input) {
+      // The next node speaks for the flow, so a free-form LLM reply here would
+      // only be an off-topic interjection ("How can I assist you today?").
+      if (context.hasNext) {
+        return {
+          success: true,
+          output: { prompt: promptMsg, description: promptMsg, user_input: data.user_input },
+          shouldPause: false
+        };
+      }
+
       const agent = data.agent || {};
 
       let personality = agent.personality || '';
@@ -180,7 +203,12 @@ class AutomationEngine {
       };
     }
 
-    return { success: true, output: { prompt: promptMsg, description: promptMsg, last_message: promptMsg }, shouldPause: true };
+    // When the previous node already asked a question, just listen; speaking
+    // this node's description would read out its label ("Candidate confirmation").
+    const alreadyAsked = /\?\s*$/.test(context.previousMessage || '');
+    const output = { prompt: promptMsg, description: promptMsg };
+    if (!alreadyAsked) output.last_message = promptMsg;
+    return { success: true, output, shouldPause: true };
   }
 
   async executeDecisionSplit(node, data) {

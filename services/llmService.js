@@ -448,7 +448,7 @@ Question Label: "${fieldLabel}"
 Question Text: "${fieldQuestion}"
 Transcript: "${transcript}"
 
-Return ONLY a JSON object with the key "value". If no answer is found or the user is just saying "hello" or irrelevant things, return {"value": null}.`
+Return ONLY a JSON object with the key "value". If the answer is a quantity, return it as a number (e.g. "about three years" -> 3). Any genuine attempt to answer counts, including "I don't know" or declining to answer; for open-ended questions return the user's answer in their own words. If no answer is found or the user is just saying "hello" or irrelevant things, return {"value": null}.`
           }]
         }],
         generationConfig: {

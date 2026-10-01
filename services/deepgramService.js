@@ -15,7 +15,7 @@ class DeepgramService {
     }
 
     try {
-      const model = voiceId || 'aura-asteria-en';
+      const model = (voiceId || 'aura-asteria-en').replace(/^aura-2-/, 'aura-');
       const sr = sampleRate || 16000;
       const response = await axios({
         method: 'POST',
@@ -30,7 +30,9 @@ class DeepgramService {
 
       const audioBuffer = Buffer.from(response.data);
 
-      await this.saveAudio(this.wrapPcmInWav(audioBuffer, sr), `deepgram_tts_${Date.now()}.wav`);
+      this.saveAudio(this.wrapPcmInWav(audioBuffer, sr), `deepgram_tts_${Date.now()}.wav`).catch(err => {
+        console.error('Error saving debug audio:', err.message);
+      });
 
       return audioBuffer;
     } catch (error) {

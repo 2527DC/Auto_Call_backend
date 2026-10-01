@@ -33,6 +33,7 @@ class VoiceAutomationService extends EventEmitter {
     this.twilioClient = null;
     // Call UUIDs of live Plivo streams, so call control goes to Plivo instead of Twilio.
     this.plivoCallIds = new Set();
+    this.ttsAudioCache = new Map();
   }
 
   async getTwilioClient(userId) {
@@ -525,7 +526,7 @@ class VoiceAutomationService extends EventEmitter {
 
             const SPEECH_THRESHOLD = 800;
             const MIN_SPEECH_MS = 200;     // ignore clicks and short noise bursts
-            const END_OF_TURN_SILENCE_MS = 1300;
+            const END_OF_TURN_SILENCE_MS = 700;   // Responsive turn-taking (cuts dead air by 600ms)
             const MAX_UTTERANCE_MS = 30000; // long interview answers
             const PRE_ROLL_MS = 400;
 
@@ -973,7 +974,7 @@ class VoiceAutomationService extends EventEmitter {
       if (provider === 'deepgram') {
         const apiKey = userSettings?.deepgram_api_key;
         const wavBuffer = this.createUlawWav(buffer);
-        await deepgramService.saveAudio(wavBuffer, `inbound_${Date.now()}.wav`);
+        deepgramService.saveAudio(wavBuffer, `inbound_${Date.now()}.wav`).catch(() => {});
         const text = await deepgramService.transcribeAudio(wavBuffer, apiKey);
         const cleanedText = text ? text.trim() : '';
         if (!cleanedText || noiseTokens.some(token => cleanedText.toLowerCase().includes(token))) {
@@ -984,7 +985,7 @@ class VoiceAutomationService extends EventEmitter {
       } else if (provider === 'sarvam_ai') {
         const apiKey = userSettings?.sarvam_ai_api_key;
         const wavBuffer = this.createUlawWav(buffer);
-        await sarvamService.saveAudio(wavBuffer, `inbound_${Date.now()}.wav`);
+        sarvamService.saveAudio(wavBuffer, `inbound_${Date.now()}.wav`).catch(() => {});
         const text = await sarvamService.transcribeAudio(wavBuffer, apiKey);
         const cleanedText = text ? text.trim() : '';
         if (!cleanedText || noiseTokens.some(token => cleanedText.toLowerCase().includes(token))) {
@@ -995,7 +996,7 @@ class VoiceAutomationService extends EventEmitter {
       } else {
         const apiKey = userSettings?.elevenlabs_api_key;
         const wavBuffer = this.createUlawWav(buffer);
-        await elevenLabsService.saveAudio(wavBuffer, `inbound_${Date.now()}.mp3`);
+        elevenLabsService.saveAudio(wavBuffer, `inbound_${Date.now()}.mp3`).catch(() => {});
         const languageCode = agent?.language ? String(agent.language).split(/[-_]/)[0].toLowerCase() : null;
         const text = await elevenLabsService.transcribeAudio(wavBuffer, apiKey, languageCode);
         const cleanedText = text ? text.trim() : '';
@@ -1038,6 +1039,31 @@ class VoiceAutomationService extends EventEmitter {
         }
       }
 
+      if (activeVoiceId && activeVoiceId.startsWith('aura-2-')) {
+        activeVoiceId = activeVoiceId.replace(/^aura-2-/, 'aura-');
+      }
+
+      const cacheKey = `${activeProvider}_${activeVoiceId || 'default'}_${text.trim()}`;
+      if (this.ttsAudioCache && this.ttsAudioCache.has(cacheKey)) {
+        console.log(`[TTS Cache HIT] Instant 0ms speech playback for: "${text.substring(0, 45)}..."`);
+        if (stream) {
+          stream.audioBuffer = [];
+        }
+        this.sendAgentAudio(ws, streamSid, this.ttsAudioCache.get(cacheKey));
+        return;
+      }
+
+      const cacheAndSend = (base64Audio) => {
+        if (this.ttsAudioCache) {
+          if (this.ttsAudioCache.size >= 300) {
+            const oldestKey = this.ttsAudioCache.keys().next().value;
+            this.ttsAudioCache.delete(oldestKey);
+          }
+          this.ttsAudioCache.set(cacheKey, base64Audio);
+        }
+        this.sendAgentAudio(ws, streamSid, base64Audio);
+      };
+
       const settings = stream?.userSettings || (stream?.userId ? await UserSettings.findOne({ user: stream.userId }) : null);
 
       if (activeProvider === 'deepgram') {
@@ -1054,7 +1080,7 @@ class VoiceAutomationService extends EventEmitter {
         const pcmBuffer = await deepgramService.generateSpeech(text, activeVoiceId || 'aura-asteria-en', {}, dgApiKey, 8000);
         const ulawBuffer = this.encodePcmToUlaw(pcmBuffer, 8000);
         const base64Audio = ulawBuffer.toString('base64');
-        this.sendAgentAudio(ws, streamSid, base64Audio);
+        cacheAndSend(base64Audio);
         return;
       }
 
@@ -1075,7 +1101,7 @@ class VoiceAutomationService extends EventEmitter {
         const pcmBuffer = await sarvamService.generateSpeech(text, activeVoiceId || 'shubh', {}, sarvamApiKey, 8000);
         const ulawBuffer = this.encodePcmToUlaw(pcmBuffer, pcmBuffer.sampleRate || 8000);
         const base64Audio = ulawBuffer.toString('base64');
-        this.sendAgentAudio(ws, streamSid, base64Audio);
+        cacheAndSend(base64Audio);
         return;
       }
 
@@ -1092,7 +1118,7 @@ class VoiceAutomationService extends EventEmitter {
       const pcmBuffer = await elevenLabsService.generateSpeech(text, activeVoiceId || 'JBFqnCBsd6RMkjVDRZzb', {}, elApiKey);
       const ulawBuffer = this.encodePcmToUlaw(pcmBuffer, 16000);
       const base64Audio = ulawBuffer.toString('base64');
-      this.sendAgentAudio(ws, streamSid, base64Audio);
+      cacheAndSend(base64Audio);
     } catch (err) {
       console.error(`[${provider || activeProvider || 'ElevenLabs'}] TTS failed, falling back to Twilio <Say>:`, err.message);
       await this.speakViaTwiml(streamSid, text);

@@ -431,42 +431,122 @@ Transcript: "${transcript}"`
         model = aiConfig.model;
         provider = aiConfig.provider;
       } else {
-        apiKey = process.env.GEMINI_API_KEY;
-        model = 'gemini-2.5-flash';
-        provider = 'gemini';
+        apiKey = process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY;
+        provider = process.env.OPENAI_API_KEY ? 'openai' : 'gemini';
+        model = provider === 'openai' ? 'gpt-4o-mini' : 'gemini-2.5-flash';
       }
 
       if (!apiKey) return null;
 
-      const modelId = model.startsWith('models/') ? model : `models/${model}`;
-      const url = `https://generativelanguage.googleapis.com/v1beta/${modelId}:generateContent?key=${apiKey}`;
-      const payload = {
-        contents: [{
-          parts: [{
-            text: `Extract the answer for the following question from the user's transcript.
+      if (provider === 'openai' || (apiKey.startsWith('sk-') && !apiKey.startsWith('sk-ant-') && provider !== 'anthropic')) {
+        return await this.extractFormFieldValueWithOpenAI(transcript, fieldLabel, fieldQuestion, model, apiKey);
+      } else if (provider === 'anthropic' || apiKey.startsWith('sk-ant-')) {
+        return await this.extractFormFieldValueWithAnthropic(transcript, fieldLabel, fieldQuestion, model, apiKey);
+      }
+
+      return await this.extractFormFieldValueWithGemini(transcript, fieldLabel, fieldQuestion, model, apiKey);
+    } catch (error) {
+      console.error('Field Extraction Error:', error.message);
+      return null;
+    }
+  }
+
+  async extractFormFieldValueWithOpenAI(transcript, fieldLabel, fieldQuestion, model, apiKey) {
+    const response = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: model || 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'system',
+            content: 'You extract specific field values from speech transcripts into JSON. Output only valid JSON with the format: {"value": <extracted_value_or_null>}. If no answer is found or the user is asking a question/clarification, return {"value": null}.'
+          },
+          {
+            role: 'user',
+            content: `Extract the answer for the following question from the user's transcript.
+Question Label: "${fieldLabel}"
+Question Text: "${fieldQuestion}"
+Transcript: "${transcript}"
+
+Return ONLY a JSON object with the key "value". If the answer is a quantity, return it as a number (e.g. "about three years" -> 3, "two years" -> 2, "or two years of experience" -> 2). Any genuine attempt to answer counts, including "I don't know" or declining to answer. If the user didn't provide an answer (e.g. they said "pardon", "what was the question"), return {"value": null}.`
+          }
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0.1,
+        max_tokens: 150
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 6000
+      }
+    );
+    const content = response.data.choices[0]?.message?.content;
+    if (!content) return null;
+    const parsed = JSON.parse(content);
+    return parsed.value !== undefined ? parsed.value : null;
+  }
+
+  async extractFormFieldValueWithAnthropic(transcript, fieldLabel, fieldQuestion, model, apiKey) {
+    const response = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model: model || 'claude-3-haiku-20240307',
+        max_tokens: 150,
+        system: 'You extract specific field values from speech transcripts into JSON. Output only valid JSON with format: {"value": <extracted_value_or_null>}. Output no other text.',
+        messages: [{
+          role: 'user',
+          content: `Extract the answer for the following question from the user's transcript.
+Question Label: "${fieldLabel}"
+Question Text: "${fieldQuestion}"
+Transcript: "${transcript}"
+
+Return ONLY a JSON object with the key "value". If the answer is a quantity, return it as a number (e.g. "about three years" -> 3, "two years" -> 2). If no answer is found, return {"value": null}.`
+        }]
+      },
+      {
+        headers: {
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'Content-Type': 'application/json'
+        },
+        timeout: 6000
+      }
+    );
+    const text = response.data.content?.[0]?.text;
+    if (!text) return null;
+    const parsed = JSON.parse(text);
+    return parsed.value !== undefined ? parsed.value : null;
+  }
+
+  async extractFormFieldValueWithGemini(transcript, fieldLabel, fieldQuestion, model, apiKey) {
+    const modelId = model.startsWith('models/') ? model : `models/${model}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/${modelId}:generateContent?key=${apiKey}`;
+    const payload = {
+      contents: [{
+        parts: [{
+          text: `Extract the answer for the following question from the user's transcript.
 Question Label: "${fieldLabel}"
 Question Text: "${fieldQuestion}"
 Transcript: "${transcript}"
 
 Return ONLY a JSON object with the key "value". If the answer is a quantity, return it as a number (e.g. "about three years" -> 3). Any genuine attempt to answer counts, including "I don't know" or declining to answer; for open-ended questions return the user's answer in their own words. If no answer is found or the user is just saying "hello" or irrelevant things, return {"value": null}.`
-          }]
-        }],
-        generationConfig: {
-          response_mime_type: "application/json",
-        }
-      };
-
-      const response = await axios.post(url, payload);
-      if (response.data.candidates && response.data.candidates[0].content) {
-        const text = response.data.candidates[0].content.parts[0].text;
-        const result = JSON.parse(text);
-        return result.value;
+        }]
+      }],
+      generationConfig: {
+        response_mime_type: "application/json",
       }
-      return null;
-    } catch (error) {
-      console.error('Field Extraction Error:', error.message);
-      return null;
+    };
+
+    const response = await axios.post(url, payload, { timeout: 6000 });
+    if (response.data.candidates && response.data.candidates[0].content) {
+      const text = response.data.candidates[0].content.parts[0].text;
+      const result = JSON.parse(text);
+      return result.value !== undefined ? result.value : null;
     }
+    return null;
   }
 
   async evaluateDecisionSplit(transcript, condition, aiConfig = null) {
@@ -478,41 +558,119 @@ Return ONLY a JSON object with the key "value". If the answer is a quantity, ret
         model = aiConfig.model;
         provider = aiConfig.provider;
       } else {
-        apiKey = process.env.GEMINI_API_KEY;
-        model = 'gemini-2.5-flash';
-        provider = 'gemini';
+        apiKey = process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY;
+        provider = process.env.OPENAI_API_KEY ? 'openai' : 'gemini';
+        model = provider === 'openai' ? 'gpt-4o-mini' : 'gemini-2.5-flash';
       }
 
       if (!apiKey) return false;
 
-      const modelId = model.startsWith('models/') ? model : `models/${model}`;
-      const url = `https://generativelanguage.googleapis.com/v1beta/${modelId}:generateContent?key=${apiKey}`;
-      const payload = {
-        contents: [{
-          parts: [{
-            text: `Evaluate if the following transcript matches the condition.
-Condition: "${condition}"
-Transcript: "${transcript}"
-
-Return ONLY a JSON object with a boolean key "match". Return {"match": true} if the transcript satisfies the condition, or {"match": false} otherwise.`
-          }]
-        }],
-        generationConfig: {
-          response_mime_type: "application/json",
-        }
-      };
-
-      const response = await axios.post(url, payload);
-      if (response.data.candidates && response.data.candidates[0].content) {
-        const text = response.data.candidates[0].content.parts[0].text;
-        const result = JSON.parse(text);
-        return result.match === true;
+      if (provider === 'openai' || (apiKey.startsWith('sk-') && !apiKey.startsWith('sk-ant-') && provider !== 'anthropic')) {
+        return await this.evaluateDecisionSplitWithOpenAI(transcript, condition, model, apiKey);
+      } else if (provider === 'anthropic' || apiKey.startsWith('sk-ant-')) {
+        return await this.evaluateDecisionSplitWithAnthropic(transcript, condition, model, apiKey);
       }
-      return false;
+
+      return await this.evaluateDecisionSplitWithGemini(transcript, condition, model, apiKey);
     } catch (error) {
       console.error('Decision Split Evaluation Error:', error.message);
       return false;
     }
+  }
+
+  async evaluateDecisionSplitWithOpenAI(transcript, condition, model, apiKey) {
+    const response = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: model || 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'system',
+            content: 'You evaluate whether a statement matches or satisfies a condition. Output only valid JSON with format: {"match": boolean}.'
+          },
+          {
+            role: 'user',
+            content: `Evaluate if the following transcript matches the condition.
+Condition: "${condition}"
+Transcript: "${transcript}"
+
+Return ONLY a JSON object with a boolean key "match". Return {"match": true} if the transcript satisfies the condition, or {"match": false} otherwise.`
+          }
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0.1,
+        max_tokens: 50
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 5000
+      }
+    );
+    const content = response.data.choices[0]?.message?.content;
+    if (!content) return false;
+    const parsed = JSON.parse(content);
+    return parsed.match === true;
+  }
+
+  async evaluateDecisionSplitWithAnthropic(transcript, condition, model, apiKey) {
+    const response = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model: model || 'claude-3-haiku-20240307',
+        max_tokens: 50,
+        system: 'You evaluate whether a statement satisfies a condition. Output only valid JSON with format: {"match": boolean}. Output no other text.',
+        messages: [{
+          role: 'user',
+          content: `Evaluate if the following transcript matches the condition.
+Condition: "${condition}"
+Transcript: "${transcript}"
+
+Return ONLY a JSON object with a boolean key "match". Return {"match": true} if the transcript satisfies the condition, or {"match": false} otherwise.`
+        }]
+      },
+      {
+        headers: {
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'Content-Type': 'application/json'
+        },
+        timeout: 5000
+      }
+    );
+    const text = response.data.content?.[0]?.text;
+    if (!text) return false;
+    const parsed = JSON.parse(text);
+    return parsed.match === true;
+  }
+
+  async evaluateDecisionSplitWithGemini(transcript, condition, model, apiKey) {
+    const modelId = model.startsWith('models/') ? model : `models/${model}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/${modelId}:generateContent?key=${apiKey}`;
+    const payload = {
+      contents: [{
+        parts: [{
+          text: `Evaluate if the following transcript matches the condition.
+Condition: "${condition}"
+Transcript: "${transcript}"
+
+Return ONLY a JSON object with a boolean key "match". Return {"match": true} if the transcript satisfies the condition, or {"match": false} otherwise.`
+        }]
+      }],
+      generationConfig: {
+        response_mime_type: "application/json",
+      }
+    };
+
+    const response = await axios.post(url, payload, { timeout: 5000 });
+    if (response.data.candidates && response.data.candidates[0].content) {
+      const text = response.data.candidates[0].content.parts[0].text;
+      const result = JSON.parse(text);
+      return result.match === true;
+    }
+    return false;
   }
 }
 

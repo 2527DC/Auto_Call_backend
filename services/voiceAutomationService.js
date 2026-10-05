@@ -1230,8 +1230,9 @@ class VoiceAutomationService extends EventEmitter {
 
     if (pcm > 32635) pcm = 32635;
 
+    // G.711 segment s holds biased values below 256 << s.
     for (seg = 0; seg < 8; seg++) {
-      if (pcm <= (160 << (seg + 1))) break;
+      if (pcm < (256 << seg)) break;
     }
 
     const uval = (seg << 4) | ((pcm >> (seg + 3)) & 0x0F);

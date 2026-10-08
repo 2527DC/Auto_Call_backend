@@ -104,7 +104,7 @@ const UserSettingsSchema = new Schema(
     },
     email_from_name: {
       type: String,
-      default: 'Autocall'
+      default: 'Voxeno'
     },
     email_from_email: {
       type: String

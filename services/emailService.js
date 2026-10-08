@@ -17,7 +17,7 @@ class EmailService {
 
       const provider = settings.email_provider || 'nodemailer';
       const config = settings.email_config || {};
-      const fromName = settings.email_from_name || 'Autocall';
+      const fromName = settings.email_from_name || 'Voxeno';
       const fromEmail = settings.email_from_email || process.env.MAIL_FROM_ADDRESS;
 
       let subject = this.resolvePlaceholders(template.subject, dynamicData);

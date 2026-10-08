@@ -63,7 +63,7 @@ async function up({ db: dbModels }) {
       },
 
       how_it_works: {
-        heading: "How AutoCall Works",
+        heading: "How Voxeno Works",
         subtitle: "A seamless journey from setup to results, designed for your growth.",
         steps: [
           {
@@ -211,7 +211,7 @@ async function up({ db: dbModels }) {
       faq: {
         section_badge: 'Questions and Answers',
         section_heading: 'Frequently asked questions',
-        section_subheading: "Everything you need to know about Autocall. Can't find the answer? Contact our team.",
+        section_subheading: "Everything you need to know about Voxeno. Can't find the answer? Contact our team.",
         faq_ids: [],
       },
 
@@ -219,18 +219,18 @@ async function up({ db: dbModels }) {
         section_badge: "We're Online",
         heading: "Let's build something incredible together",
         subheading: 'Have specific volume requirements or custom integration plans? Reach out and our engineering support team will respond in a few hours.',
-        email: 'support@autocall.com',
+        email: 'support@voxeno.ai',
         phone: null,
         address: null,
         live_chat_label: 'Available 24/7',
       },
 
       footer: {
-        tagline: 'AutoCall is a unified platform for AI voice assistents, customer engagement, workflow automation, and business communication.',
-        copyright: `© ${new Date().getFullYear()} Autocall. All Rights Reserved.`,
+        tagline: 'Voxeno is a unified platform for AI voice assistents, customer engagement, workflow automation, and business communication.',
+        copyright: `© ${new Date().getFullYear()} Voxeno. All Rights Reserved.`,
         address: null,
         phone: null,
-        email: 'support@autocall.com',
+        email: 'support@voxeno.ai',
         social_links: [
           { name: 'Facebook', href: '#', icon: 'Facebook' },
           { name: 'Twitter', href: '#', icon: 'Twitter' },

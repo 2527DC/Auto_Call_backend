@@ -70,7 +70,7 @@ const LandingPageSchema = new Schema(
     },
 
     how_it_works: {
-      heading: { type: String, default: 'How AutoCall Works' },
+      heading: { type: String, default: 'How Voxeno Works' },
       subtitle: { type: String, default: 'A seamless journey from setup to results, designed for your growth.' },
       steps: {
         type: [HowItWorksStepSchema],
@@ -132,7 +132,7 @@ const LandingPageSchema = new Schema(
       section_badge: { type: String, default: "We're Online" },
       heading: { type: String, default: "Let's build something incredible together" },
       subheading: { type: String, default: null },
-      email: { type: String, default: 'support@autocall.com' },
+      email: { type: String, default: 'support@voxeno.ai' },
       phone: { type: String, default: null },
       address: { type: String, default: null },
       live_chat_label: { type: String, default: 'Available 24/7' }
@@ -140,10 +140,10 @@ const LandingPageSchema = new Schema(
 
     footer: {
       tagline: { type: String, default: null },
-      copyright: { type: String, default: '© 2025 Autocall AI. All Rights Reserved.' },
+      copyright: { type: String, default: '© 2025 Voxeno AI. All Rights Reserved.' },
       address: { type: String, default: null },
       phone: { type: String, default: null },
-      email: { type: String, default: 'support@autocall.com' },
+      email: { type: String, default: 'support@voxeno.ai' },
       social_links: [SocialLinkSchema]
     }
   },

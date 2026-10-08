@@ -34,7 +34,7 @@ const dispatchEvent = async (userId, eventName, payload) => {
             timeout: 5000,
             headers: {
               'Content-Type': 'application/json',
-              'User-Agent': 'Autocall-Webhook/1.0'
+              'User-Agent': 'Voxeno-Webhook/1.0'
             }
           });
         } catch (error) {

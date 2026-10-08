@@ -520,7 +520,7 @@ const PayPalService = {
           plan_id: paypalPlanId,
           custom_id: userId ? userId.toString() : undefined,
           application_context: {
-            brand_name: process.env.APP_NAME || 'Autocall',
+            brand_name: process.env.APP_NAME || 'Voxeno',
             locale: 'en-US',
             shipping_preference: 'NO_SHIPPING',
             user_action: 'SUBSCRIBE_NOW',

@@ -1,17 +1,17 @@
 const Setting = require('../models/setting.model');
 
 const defaultSettings = {
-  app_name: 'AutoCall',
+  app_name: 'Voxeno',
   app_description: 'A modern AI Builder application',
   app_email: 'support@example.com',
   support_email: 'support@example.com',
 
   favicon_url: 'uploads/logo/favicon.png',
-  logo_light_url: 'uploads/logo/autocall-logo.png',
+  logo_light_url: 'uploads/logo/voxeno-logo.png',
   logo_dark_url: '',
-  sidebar_logo_url: 'uploads/logo/autocall-logo.png',
+  sidebar_logo_url: 'uploads/logo/voxeno-logo.png',
   mobile_logo_url: '',
-  landing_logo_url: 'uploads/logo/autocall-logo.png',
+  landing_logo_url: 'uploads/logo/voxeno-logo.png',
   favicon_notification_logo_url: '',
   onboarding_logo_url: '',
 
@@ -33,8 +33,8 @@ const defaultSettings = {
   smtp_port: 587,
   smtp_user: '',
   smtp_pass: '',
-  mail_from_name: 'AutoCall',
-  mail_from_email: 'noreply@autocall.ai',
+  mail_from_name: 'Voxeno',
+  mail_from_email: 'noreply@voxeno.ai',
   mail_encryption: 'tls',
 
   session_expiration_days: 7,

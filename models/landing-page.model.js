@@ -41,7 +41,7 @@ const LandingPageSchema = new Schema(
       subheading: { type: String, default: null },
       cta_primary_text: { type: String, default: "Let's Talk" },
       cta_secondary_text: { type: String, default: 'View Documentation' },
-      cta_secondary_link: { type: String, default: 'https://docs.pixelstrap.net/autocall' },
+      cta_secondary_link: { type: String, default: '' },
       image: { type: String, default: null },
     },
     primary_features: {

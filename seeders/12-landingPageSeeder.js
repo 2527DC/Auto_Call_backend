@@ -11,7 +11,7 @@ async function up({ db: dbModels }) {
         subheading: 'Handle incoming calls, run outbound campaigns, collect customer information, and automate follow-ups from a single platform',
         cta_primary_text: "Let's Talk",
         cta_secondary_text: 'View Documentation',
-        cta_secondary_link: 'https://docs.pixelstrap.net/autocall',
+        cta_secondary_link: '',
         image: null,
       },
 

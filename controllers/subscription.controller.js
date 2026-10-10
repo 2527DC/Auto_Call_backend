@@ -97,7 +97,7 @@ exports.startTrial = async (req, res) => {
       payment_gateway: 'free',
       payment_method: 'free',
       payment_status: 'paid',
-      currency: plan.currency || 'USD',
+      currency: plan.currency || 'INR',
       features: plan.features || null,
     });
 
@@ -171,7 +171,7 @@ exports.createStripeSubscription = async (req, res) => {
         payment_gateway: 'stripe',
         payment_method: 'card',
         payment_status: 'pending',
-        currency: (plan.currency || 'USD').toString().toUpperCase(),
+        currency: (plan.currency || 'INR').toString().toUpperCase(),
         features: plan.features || null,
       });
     }
@@ -377,7 +377,7 @@ exports.createPayPalSubscription = async (req, res) => {
         payment_gateway: 'paypal',
         payment_method: 'paypal',
         payment_status: 'pending',
-        currency: (plan.currency || 'USD').toString().toUpperCase(),
+        currency: (plan.currency || 'INR').toString().toUpperCase(),
         paypal_subscription_id: paypalResult.paypalSubscriptionId,
         features: plan.features || null,
       });
@@ -639,7 +639,7 @@ exports.createManualSubscription = async (req, res) => {
       bank_routing_number: manual_payment_type === 'bank_transfer' ? (bank_routing_number || null) : null,
       bank_ifsc_no: manual_payment_type === 'bank_transfer' ? (bank_ifsc_no || bank_ifsc_code || null) : null,
       bank_ifsc_code: manual_payment_type === 'bank_transfer' ? (bank_ifsc_code || bank_ifsc_no || null) : null,
-      currency: (plan.currency || 'USD').toString().toUpperCase(),
+      currency: (plan.currency || 'INR').toString().toUpperCase(),
       amount_paid: 0,
       features: plan.features || null,
       auto_renew: false,
@@ -1175,7 +1175,7 @@ exports.approveManualSubscription = async (req, res) => {
       subscription_id: subscription._id,
       plan_id: plan._id,
       amount: plan.price || 0,
-      currency: subscription.currency || plan.currency || 'USD',
+      currency: subscription.currency || plan.currency || 'INR',
       payment_method: subscription.manual_payment_type || 'manual',
       payment_status: 'success',
       payment_gateway: 'manual',
@@ -1236,7 +1236,7 @@ exports.rejectManualSubscription = async (req, res) => {
       subscription_id: subscription._id,
       plan_id: plan ? plan._id : null,
       amount: plan ? (plan.price || plan.amount || 0) : 0,
-      currency: subscription.currency || (plan ? plan.currency : 'USD') || 'USD',
+      currency: subscription.currency || (plan ? plan.currency : 'INR') || 'INR',
       payment_method: subscription.manual_payment_type || 'manual',
       payment_status: 'failed',
       payment_gateway: 'manual',
@@ -1329,7 +1329,7 @@ exports.assignPlanToUser = async (req, res) => {
       approved_by: adminId,
       approved_at: now,
       created_by: adminId,
-      currency: (plan.currency || 'USD').toString().toUpperCase(),
+      currency: (plan.currency || 'INR').toString().toUpperCase(),
       amount_paid: amountPaid,
       features: plan.features || null,
       auto_renew: false,

@@ -71,7 +71,7 @@ const SubscriptionSchema = new mongoose.Schema(
     },
     transaction_id: { type: String, default: null },
     amount_paid: { type: Number, default: 0 },
-    currency: { type: String, default: 'USD' },
+    currency: { type: String, default: 'INR' },
     payment_reference: { type: String, default: null },
     transaction_receipt: { type: String, default: null },
     manual_payment_type: {

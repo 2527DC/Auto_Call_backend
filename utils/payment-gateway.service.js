@@ -140,7 +140,7 @@ const StripeService = {
   async createPrice(productId, plan) {
     const stripe = await this._getStripe();
     if (!stripe) throw new Error('Stripe not configured');
-    const currency = (plan.currency || 'usd').toString().toLowerCase();
+    const currency = (plan.currency || 'inr').toString().toLowerCase();
     const unitAmount = Math.round((plan.amount || 0) * 100);
     const isRecurring = plan.billing_cycle === 'monthly' || plan.billing_cycle === 'yearly';
     const priceParams = {
@@ -466,7 +466,7 @@ const PayPalService = {
     }
     try {
       const { token, apiUrl } = await this.getAccessToken();
-      const currency = (plan.currency || 'USD').toString().toUpperCase();
+      const currency = (plan.currency || 'INR').toString().toUpperCase();
       const intervalUnit = plan.billing_cycle === 'yearly' ? 'YEAR' : 'MONTH';
       const response = await fetch(`${apiUrl}/v1/billing/plans`, {
         method: 'POST',

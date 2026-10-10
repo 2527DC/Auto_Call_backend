@@ -101,11 +101,11 @@ const PaymentGatewayConfigSchema = new mongoose.Schema(
     },
     currency: {
       type: String,
-      default: 'USD',
+      default: 'INR',
     },
     supported_currencies: {
       type: [String],
-      default: ['USD', 'EUR', 'GBP', 'INR'],
+      default: ['INR'],
     },
     enable_trial: {
       type: Boolean,

@@ -106,7 +106,7 @@ exports.initiatePurchase = async (req, res) => {
         payment_method_types: ['card'],
         line_items: [{
           price_data: {
-            currency: 'usd',
+            currency: 'inr',
             product_data: { name: `Phone Number - ${phoneNumber.phone_number}` },
             unit_amount: Math.round(purchasePrice * 100),
           },
@@ -141,7 +141,7 @@ exports.initiatePurchase = async (req, res) => {
         body: JSON.stringify({
           intent: 'CAPTURE',
           purchase_units: [{
-            amount: { currency_code: 'USD', value: purchasePrice.toFixed(2) },
+            amount: { currency_code: 'INR', value: purchasePrice.toFixed(2) },
             description: `Phone Number Purchase - ${phoneNumber.phone_number}`
           }],
           application_context: {

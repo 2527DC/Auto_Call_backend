@@ -13,7 +13,7 @@ exports.up = async ({ db }, mongoose) => {
         is_popular: false,
         status: 'active',
         amount: 0,
-        currency: 'USD',
+        currency: 'INR',
       },
       {
         name: 'Pro Plan',
@@ -26,7 +26,7 @@ exports.up = async ({ db }, mongoose) => {
         is_popular: true,
         status: 'active',
         amount: 29,
-        currency: 'USD',
+        currency: 'INR',
       },
       {
         name: 'Enterprise Plan',
@@ -39,7 +39,7 @@ exports.up = async ({ db }, mongoose) => {
         is_popular: false,
         status: 'active',
         amount: 99,
-        currency: 'USD',
+        currency: 'INR',
       }
     ];
 

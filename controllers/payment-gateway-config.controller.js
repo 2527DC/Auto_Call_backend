@@ -62,7 +62,7 @@ function _defaultConfig(gateway_name, userId) {
     enable_manual_payment: false,
     manual_payment_instructions: null,
     bank_details: {},
-    currency: 'USD',
+    currency: 'INR',
     enable_trial: true,
     trial_days_limit: 14,
     config: {},

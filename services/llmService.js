@@ -680,6 +680,120 @@ Return ONLY a JSON object with a boolean key "match". Return {"match": true} if 
     }
     return false;
   }
+
+  async generateChatAssistantResponse({ messages, systemPrompt, provider = 'gemini', model = 'gemini-2.5-flash', apiKey, temperature = 0.2, maxTokens = 1500 }) {
+    if (!apiKey) {
+      throw new Error(`API Key is missing for provider ${provider}`);
+    }
+
+    const cleanProvider = (provider || 'gemini').toLowerCase();
+
+    if (cleanProvider === 'gemini') {
+      return await this.callGeminiChat(messages, systemPrompt, model, apiKey, temperature, maxTokens);
+    } else if (cleanProvider === 'openai') {
+      return await this.callOpenAIChat(messages, systemPrompt, model, apiKey, temperature, maxTokens);
+    } else if (cleanProvider === 'anthropic') {
+      return await this.callAnthropicChat(messages, systemPrompt, model, apiKey, temperature, maxTokens);
+    } else {
+      throw new Error(`Unsupported AI provider: ${provider}`);
+    }
+  }
+
+  async callGeminiChat(messages, systemPrompt, model, apiKey, temperature = 0.2, maxTokens = 1500) {
+    const modelId = model.startsWith('models/') ? model : `models/${model}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/${modelId}:generateContent?key=${apiKey}`;
+
+    const contents = (messages || []).map(m => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: m.content }]
+    }));
+
+    const payload = {
+      contents,
+      system_instruction: {
+        parts: [{ text: systemPrompt }]
+      },
+      generationConfig: {
+        temperature: Number(temperature) || 0.2,
+        maxOutputTokens: Number(maxTokens) || 1500
+      }
+    };
+
+    let response;
+    try {
+      response = await axios.post(url, payload, { timeout: 30000 });
+    } catch (err) {
+      if (err.response && err.response.status === 429) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const fallbackUrl = url.replace(model, 'gemini-1.5-flash');
+        response = await axios.post(fallbackUrl, payload, { timeout: 30000 });
+      } else {
+        throw err;
+      }
+    }
+
+    if (response.data.candidates && response.data.candidates[0].content) {
+      return response.data.candidates[0].content.parts[0].text;
+    }
+    throw new Error('No response returned from Gemini');
+  }
+
+  async callOpenAIChat(messages, systemPrompt, model, apiKey, temperature = 0.2, maxTokens = 1500) {
+    const formattedMessages = [
+      { role: 'system', content: systemPrompt },
+      ...(messages || []).map(m => ({
+        role: m.role === 'assistant' ? 'assistant' : 'user',
+        content: m.content
+      }))
+    ];
+
+    const response = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: model || 'gpt-4o-mini',
+        messages: formattedMessages,
+        temperature: Number(temperature) || 0.2,
+        max_tokens: Number(maxTokens) || 1500
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      }
+    );
+
+    return response.data.choices[0].message.content;
+  }
+
+  async callAnthropicChat(messages, systemPrompt, model, apiKey, temperature = 0.2, maxTokens = 1500) {
+    const formattedMessages = (messages || []).map(m => ({
+      role: m.role === 'assistant' ? 'assistant' : 'user',
+      content: m.content
+    }));
+
+    const response = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model: model || 'claude-3-haiku-20240307',
+        max_tokens: Number(maxTokens) || 1500,
+        temperature: Number(temperature) || 0.2,
+        system: systemPrompt,
+        messages: formattedMessages
+      },
+      {
+        headers: {
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      }
+    );
+
+    return response.data.content[0].text;
+  }
 }
 
 module.exports = new LLMService();

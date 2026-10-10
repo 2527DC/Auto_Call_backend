@@ -136,6 +136,7 @@ const emailTemplateRoutes = require('./routes/email-template.routes');
 const eventWebhookRoutes = require('./routes/event-webhook.routes');
 const impersonateRoutes = require('./routes/impersonation.routes');
 const dialerRoutes = require('./routes/dialer.routes');
+const systemAssistantRoutes = require('./routes/system-assistant.routes');
 
 const { denyMutationInDemo } = require('./middlewares/demo-mode');
 const { checkImpersonationStatus, restrictImpersonationActions } = require('./middlewares/impersonation');
@@ -209,6 +210,7 @@ app.use('/api/email-library', emailTemplateRoutes);
 app.use('/api/event-webhooks', eventWebhookRoutes);
 app.use('/api/impersonate', impersonateRoutes);
 app.use('/api/dialer', dialerRoutes);
+app.use('/api/system-assistant', systemAssistantRoutes);
 
 app.get("/", (req, res) => {
   res.json({ message: "App is running successfully" });

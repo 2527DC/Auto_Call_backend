@@ -13,6 +13,7 @@ const Contact = require('../models/contact.model');
 const SMSLog = require('../models/sms-log.model');
 const SMSCampaign = require('../models/sms-campaign.model');
 const { db } = require('../models');
+const creditService = require('./creditService');
 
 
 class SmsAutomationService {
@@ -400,6 +401,12 @@ class SmsAutomationService {
         return { success: true, message: 'Human handoff triggered' };
       }
 
+      const ownerId = session.user_id._id || session.user_id;
+      if (!(await creditService.hasCredits(ownerId))) {
+        console.warn(`[SMS] User ${ownerId} has no credits left; not sending an AI reply.`);
+        return { success: false, message: 'Insufficient credits' };
+      }
+
       const messages = await SmsMessage.find({ session_id: session._id })
         .sort({ created_at: 1 })
         .limit(10);
@@ -455,6 +462,9 @@ class SmsAutomationService {
             content: aiResponse,
             twilio_message_sid: twilioMsgSid
           });
+
+          await creditService.chargeMessage(ownerId, 'credits_per_sms', 'sms_deduction', `AI SMS reply to ${fromNumber}`, session._id, 'sms_session')
+            .catch((e) => console.error('[SMS] Credit charge failed:', e.message));
 
           console.log(`[SMS] AI replied: "${aiResponse}"`);
         } else {

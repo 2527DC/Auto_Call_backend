@@ -49,10 +49,10 @@ if (process.env.REDIS_URL) {
 
       console.log(`Executing campaign: ${campaign.name}`);
 
-      const settings = await UserSettings.findOne({ user: campaign.userId });
-      if (!settings || !settings.twilio_account_sid || !settings.twilio_auth_token) {
-        throw new Error('Twilio credentials not found for this user');
-      }
+      // Each provider branch below checks only the credentials it needs.
+      const settings = (await UserSettings.findOne({ user: campaign.userId })) || {};
+      const plivoAuthId = settings.plivo_auth_id || process.env.PLIVO_AUTH_ID;
+      const plivoAuthToken = settings.plivo_auth_token || process.env.PLIVO_AUTH_TOKEN;
 
       let phoneNumberDoc;
       let fromNumber;
@@ -148,6 +148,21 @@ if (process.env.REDIS_URL) {
           const currentCampaign = await Campaign.findById(campaignId).select('campaignStatus');
           if (currentCampaign && ['Paused', 'Cancelled'].includes(currentCampaign.campaignStatus)) {
             console.log(`Campaign ${campaignId} was ${currentCampaign.campaignStatus}. Stopping execution.`);
+            isStopped = true;
+            break;
+          }
+
+          // Never place a call the client can't pay for: pause until they top up.
+          if (!(await creditService.hasCredits(campaign.userId))) {
+            console.log(`Campaign ${campaignId} paused: no credits left.`);
+            await Campaign.findByIdAndUpdate(campaignId, { campaignStatus: 'Paused', fail_reason: 'Paused because credits ran out. Top up and resume.' });
+            await notificationHelper.sendNotification(
+              app,
+              campaign.userId,
+              'CAMPAIGN_STATUS',
+              'Campaign Paused',
+              `Your campaign "${campaign.name}" was paused because your credits ran out.`
+            ).catch((notifErr) => console.error(`Failed to send notification for campaign ${campaignId}:`, notifErr));
             isStopped = true;
             break;
           }
@@ -266,15 +281,15 @@ if (process.env.REDIS_URL) {
               console.log(`SIP Call to ${to} initiated with ID: ${callSid}`);
               successCount++;
             } else if (phoneNumberDoc.provider === 'plivo' || phoneNumberDoc.type === 'sip') {
-              if (!settings.plivo_auth_id || !settings.plivo_auth_token) {
+              if (!plivoAuthId || !plivoAuthToken) {
                 throw new Error('Plivo credentials not found for this user');
               }
               const xmlUrl = `${appUrl}/api/calls/plivo-xml?flowId=${flowId}&userId=${campaign.userId}&agentId=${campaign.agentId}`;
               const statusCallbackUrl = `${appUrl}/api/calls/plivo-status`;
 
               const plivoCall = await plivoService.makeCall(
-                settings.plivo_auth_id,
-                settings.plivo_auth_token,
+                plivoAuthId,
+                plivoAuthToken,
                 fromNumber,
                 to,
                 xmlUrl,
@@ -299,8 +314,8 @@ if (process.env.REDIS_URL) {
                 await new Promise(resolve => setTimeout(resolve, 10000));
                 try {
                   callStatus = await plivoService.getCallStatus(
-                    settings.plivo_auth_id,
-                    settings.plivo_auth_token,
+                    plivoAuthId,
+                    plivoAuthToken,
                     plivoCall.requestUuid
                   );
                 } catch (statusError) {
@@ -321,6 +336,9 @@ if (process.env.REDIS_URL) {
 
               successCount++;
             } else {
+              if (!settings.twilio_account_sid || !settings.twilio_auth_token) {
+                throw new Error('Twilio credentials not found for this user');
+              }
               const statusCallbackUrl = `${appUrl}/api/calls/status`;
               const call = await twilioService.makeCall(
                 settings.twilio_account_sid,
@@ -454,10 +472,8 @@ if (process.env.REDIS_URL) {
 
       console.log(`Executing SMS campaign: ${campaign.name}`);
 
-      const settings = await UserSettings.findOne({ user: campaign.user_id });
-      if (!settings || !settings.twilio_account_sid || !settings.twilio_auth_token) {
-        throw new Error('Twilio credentials not found for this user');
-      }
+      // The send branch below checks only the credentials its provider needs.
+      const settings = (await UserSettings.findOne({ user: campaign.user_id })) || {};
 
       const phoneNumberDoc = await PhoneNumber.findById(campaign.phoneNumberId);
       if (!phoneNumberDoc) {
@@ -609,6 +625,9 @@ if (process.env.REDIS_URL) {
               );
               twilioMessageSid = sentMessage.messageUuid ? sentMessage.messageUuid[0] : null;
             } else {
+              if (!settings.twilio_account_sid || !settings.twilio_auth_token) {
+                throw new Error('Twilio credentials not found for this user');
+              }
               sentMessage = await twilioService.sendSMS(
                 settings.twilio_account_sid,
                 settings.twilio_auth_token,
@@ -626,7 +645,8 @@ if (process.env.REDIS_URL) {
                 'sms_deduction',
                 `SMS Campaign: ${campaign.name} (To: ${to})`,
                 campaign._id,
-                'sms_campaign'
+                'sms_campaign',
+                { allowNegative: true }
               );
             }
 

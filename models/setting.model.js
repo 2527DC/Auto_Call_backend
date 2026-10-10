@@ -306,8 +306,26 @@ const SettingSchema = new Schema(
     credit_deduction_type: {
       type: String,
       enum: ['per_call', 'per_minute'],
-      default: 'per_call'
+      default: 'per_minute'
     },
+    // Call credits are multiplied by these for agents using a costlier voice.
+    credit_multiplier_deepgram: { type: Number, default: 1 },
+    credit_multiplier_sarvam_ai: { type: Number, default: 1 },
+    credit_multiplier_elevenlabs: { type: Number, default: 2 },
+    // Meta bills the client's own WhatsApp account, so this is an optional platform fee.
+    credits_per_whatsapp_message: { type: Number, default: 0 },
+    // What providers charge you, in rupees, for the cost and profit report.
+    cost_telephony_per_minute: { type: Number, default: 0.38 },
+    cost_stt_per_minute_deepgram: { type: Number, default: 0.42 },
+    cost_stt_per_minute_sarvam_ai: { type: Number, default: 0.5 },
+    cost_stt_per_minute_elevenlabs: { type: Number, default: 0.36 },
+    cost_tts_per_1k_chars_deepgram: { type: Number, default: 1.46 },
+    cost_tts_per_1k_chars_sarvam_ai: { type: Number, default: 3 },
+    cost_tts_per_1k_chars_elevenlabs: { type: Number, default: 3.88 },
+    cost_llm_input_per_1m_tokens: { type: Number, default: 14.55 },
+    cost_llm_output_per_1m_tokens: { type: Number, default: 58.2 },
+    cost_sms_per_message: { type: Number, default: 0 },
+    cost_whatsapp_per_message: { type: Number, default: 0 },
     credits_per_call: {
       type: Number,
       default: 1

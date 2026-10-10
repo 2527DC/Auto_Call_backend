@@ -169,7 +169,7 @@ exports.handleOutboundWebhook = async (req, res) => {
 
       if (!isAdmin) {
         const balance = await creditService.getCreditBalance(userId);
-        if (balance <= 0) {
+        if (balance.available_credits <= 0) {
           return res.status(402).send('Insufficient credits');
         }
       }

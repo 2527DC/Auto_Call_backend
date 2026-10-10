@@ -98,7 +98,9 @@ exports.updateSettings = async (req, res) => {
     const aiFields = ['openai_api_key'];
     const demoFields = ['demo_user_email', 'demo_user_password', 'is_demo_mode'];
     const widgetFields = ['login_widget_key'];
-    const creditFields = ['credit_deduction_type', 'credits_per_call', 'credits_per_minute', 'free_credits_on_registration', 'credits_per_sms'];
+    const creditFields = ['credit_deduction_type', 'credits_per_call', 'credits_per_minute', 'free_credits_on_registration', 'credits_per_sms',
+      'credit_multiplier_deepgram', 'credit_multiplier_sarvam_ai', 'credit_multiplier_elevenlabs', 'credits_per_whatsapp_message', 'cost_telephony_per_minute', 'cost_stt_per_minute_deepgram', 'cost_stt_per_minute_sarvam_ai', 'cost_stt_per_minute_elevenlabs', 'cost_tts_per_1k_chars_deepgram', 'cost_tts_per_1k_chars_sarvam_ai', 'cost_tts_per_1k_chars_elevenlabs', 'cost_llm_input_per_1m_tokens', 'cost_llm_output_per_1m_tokens', 'cost_sms_per_message', 'cost_whatsapp_per_message'
+    ];
     const agreementFields = ['registration_otp_required', 'signup_agreement_enabled', 'signup_agreement_prefix_text', 'signup_agreement_link_text', 'signup_agreement_target_page'];
     const kycFields = ['kyc_allow_pdf_upload', 'kyc_required', 'kyc_max_files', 'kyc_form_fields'];
 
@@ -170,6 +172,7 @@ exports.updateSettings = async (req, res) => {
       'default_knowledgebase_limit', 'default_storage_limit', 'default_contact_limit',
       'default_sms_agent_limit', 'default_sms_campaign_limit_per_day', 'default_campaign_sms_limit',
       'credits_per_call', 'credits_per_minute', 'free_credits_on_registration', 'credits_per_sms',
+      'credit_multiplier_deepgram', 'credit_multiplier_sarvam_ai', 'credit_multiplier_elevenlabs', 'credits_per_whatsapp_message', 'cost_telephony_per_minute', 'cost_stt_per_minute_deepgram', 'cost_stt_per_minute_sarvam_ai', 'cost_stt_per_minute_elevenlabs', 'cost_tts_per_1k_chars_deepgram', 'cost_tts_per_1k_chars_sarvam_ai', 'cost_tts_per_1k_chars_elevenlabs', 'cost_llm_input_per_1m_tokens', 'cost_llm_output_per_1m_tokens', 'cost_sms_per_message', 'cost_whatsapp_per_message',
       'kyc_max_files'
     ];
 

@@ -108,6 +108,22 @@ const CallSchema = new Schema(
       type: Number,
       default: 0
     },
+    // Set once when the call is charged, so the stream close and the provider's
+    // status callback can't both charge it.
+    credits_charged: {
+      type: Boolean,
+      default: false
+    },
+    // What the call used from paid providers, for the cost and profit report.
+    usage: {
+      telephony_provider: { type: String, default: null },
+      stt_provider: { type: String, default: null },
+      stt_seconds: { type: Number, default: 0 },
+      tts_provider: { type: String, default: null },
+      tts_characters: { type: Number, default: 0 },
+      llm_input_tokens: { type: Number, default: 0 },
+      llm_output_tokens: { type: Number, default: 0 }
+    },
     post_call_handled: {
       type: Boolean,
       default: false

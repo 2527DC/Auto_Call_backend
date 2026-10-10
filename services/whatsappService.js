@@ -1,11 +1,15 @@
 const axios = require('axios');
 const { db } = require('../models');
+const creditService = require('./creditService');
 const { WhatsappWaba, WhatsAppTemplate, WhatsAppLog, WhatsappPhoneNumber } = db;
 
 const API_VERSION = 'v21.0';
 
 class WhatsAppService {
   async sendTemplateMessage({ userId, to, templateId, dynamicData, callId, campaignId }) {
+    if ((await creditService.getMessageCredits('credits_per_whatsapp_message')) > 0 && !(await creditService.hasCredits(userId))) {
+      throw new Error('Insufficient credits to send WhatsApp message');
+    }
     try {
       const template = await WhatsAppTemplate.findById(templateId).populate('waba_id');
       if (!template) throw new Error('Template not found');
@@ -44,6 +48,9 @@ class WhatsAppService {
         call_id: callId,
         campaign_id: campaignId
       });
+
+      await creditService.chargeMessage(userId, 'credits_per_whatsapp_message', 'whatsapp_deduction', `WhatsApp template to ${to}`, campaignId || callId || null, campaignId ? 'campaign' : 'call')
+        .catch((e) => console.error('[WhatsApp] Credit charge failed:', e.message));
 
       return { success: true, messageId };
     } catch (error) {

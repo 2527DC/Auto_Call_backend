@@ -12,6 +12,7 @@ const appointmentService = require('../services/appointmentService');
 const axios = require('axios');
 const { sendMail } = require('../utils/mail');
 const webhookDispatcher = require('../services/webhookDispatcher');
+const creditService = require('../services/creditService');
 
 class AutomationEngine {
   constructor() {
@@ -617,6 +618,11 @@ class AutomationEngine {
         return { success: true, output: { whatsapp_sent: false, error: 'Template not found' } };
       }
 
+      if ((await creditService.getMessageCredits('credits_per_whatsapp_message')) > 0 && !(await creditService.hasCredits(template.user_id))) {
+        console.warn(`[WhatsApp Notice] User ${template.user_id} has no credits left; not sending.`);
+        return { success: true, output: { whatsapp_sent: false, error: 'Insufficient credits' } };
+      }
+
       const waba = await WhatsappWaba.findOne({ _id: template.waba_id, deleted_at: null }).lean();
       if (!waba) {
         console.warn('[WhatsApp Notice] WABA connection not found for template.');
@@ -702,6 +708,9 @@ class AutomationEngine {
         direction: 'outbound',
         call_id: data.call?._id || null
       });
+
+      await creditService.chargeMessage(template.user_id, 'credits_per_whatsapp_message', 'whatsapp_deduction', `WhatsApp template to ${recipientNumber}`, data.call?._id || null, 'call')
+        .catch((e) => console.error('[WhatsApp Notice] Credit charge failed:', e.message));
 
       console.log(`[WhatsApp Notice] Message sent successfully to ${recipientNumber}. Message SID: ${messageSid}`);
       return { success: true, output: { whatsapp_sent: true, message_sid: messageSid } };

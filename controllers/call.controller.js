@@ -67,6 +67,10 @@ exports.placeCall = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Source phone number not found in your account' });
     }
 
+    if (!(await creditService.hasCredits(userId))) {
+      return res.status(402).json({ success: false, message: 'Insufficient credits. Please top up to place calls.' });
+    }
+
     let callLog;
 
     if (sourceNumber.type === 'sip' && sourceNumber.elevenlabs_phone_number_id && agent.elevenlabs_agent_id) {

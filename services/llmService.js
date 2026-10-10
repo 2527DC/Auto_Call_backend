@@ -1,4 +1,12 @@
-const axios = require('axios');
+const { recordLlmResponse } = require('../utils/usageMeter');
+
+// Every AI provider reports token counts in its response; record them against
+// the call being handled, for the cost and profit report.
+const axios = require('axios').create();
+axios.interceptors.response.use((response) => {
+  recordLlmResponse(response.data);
+  return response;
+});
 
 class LLMService {
   async generateResponse(prompt, personality, model = 'gemini-2.5-flash', aiConfig = null) {

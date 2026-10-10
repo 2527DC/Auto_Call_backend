@@ -113,6 +113,7 @@ const whatsappTemplateRoutes = require('./routes/whatsapp-template.routes');
 const automationRoutes = require('./routes/automation.routes');
 const dashboardRoutes = require('./routes/dashboard.routes');
 const landingPageRoutes = require('./routes/landing-page.routes');
+const usageReportRoutes = require('./routes/usage-report.routes');
 const uploadRoutes = require('./routes/upload.routes');
 const apiKeyRoutes = require('./routes/api-key.routers');
 const googleRoutes = require('./routes/google.routes');
@@ -185,6 +186,7 @@ app.use('/api/whatsapp-template', whatsappTemplateRoutes);
 app.use('/api/automation', automationRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/landing-page', landingPageRoutes);
+app.use('/api/usage-report', usageReportRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/api-keys', apiKeyRoutes)
 app.use('/api/tenant-guide', tenantGuideRoutes)

@@ -9,6 +9,8 @@ const appointmentService = require('./appointmentService');
 const twilio = require('twilio');
 const plivo = require('plivo');
 const { db } = require('../models');
+const creditService = require('./creditService');
+const { newUsage, runWithUsage, recordUsage } = require('../utils/usageMeter');
 const Call = db.Call;
 const Flow = db.Flow;
 const Agent = db.Agent;
@@ -167,7 +169,6 @@ class VoiceAutomationService extends EventEmitter {
 
       // Process credit deduction
       try {
-        const creditService = require('./creditService');
         const creditResult = await creditService.processCallCreditDeduction(
           call.user_id,
           call._id,
@@ -197,6 +198,10 @@ class VoiceAutomationService extends EventEmitter {
     const closingStream = this.activeStreams.get(streamSid);
     if (!closingStream) return;
     if (closingStream.callSid) {
+      if (closingStream.usage) {
+        Call.updateOne({ twilio_call_sid: closingStream.callSid }, { $set: { usage: closingStream.usage } })
+          .catch((e) => console.error('[Usage] Could not save call usage:', e.message));
+      }
       this.handleStreamCallCompletion(closingStream.callSid, closingStream.userId);
       this.handlePostCallIntegrations(closingStream.callSid, closingStream.userId);
       this.plivoCallIds.delete(closingStream.callSid);
@@ -258,8 +263,9 @@ class VoiceAutomationService extends EventEmitter {
     let flowId = null;
     let agentId = null;
     let userId = null;
+    const usage = newUsage();
 
-    ws.on('message', async (message) => {
+    ws.on('message', (message) => runWithUsage(usage, async () => {
       const msg = JSON.parse(message);
 
       switch (msg.event) {
@@ -293,7 +299,9 @@ class VoiceAutomationService extends EventEmitter {
           agentId = customData.agentId && customData.agentId !== 'undefined' && customData.agentId !== 'null' ? customData.agentId : null;
           userId = customData.userId && customData.userId !== 'undefined' && customData.userId !== 'null' ? customData.userId : null;
 
+          usage.telephony_provider = isPlivo ? 'plivo' : 'twilio';
           this.activeStreams.set(streamSid, {
+            usage,
             provider: isPlivo ? 'plivo' : 'twilio',
             callSid,
             flowId,
@@ -330,6 +338,13 @@ class VoiceAutomationService extends EventEmitter {
               startStream.userSettings = userSettings;
             }
             console.log(`[Timing] Stream setup lookups took ${Date.now() - startedAt}ms`);
+
+            if (callLog?.direction === 'inbound' && !(await creditService.hasCredits(userId))) {
+              console.warn(`[Credits] User ${userId} has no credits left; hanging up inbound call ${callSid}.`);
+              const client = await this.getCallControlClient(userId);
+              await client?.calls(callSid).update({ status: 'completed' }).catch((e) => console.error('Hangup failed:', e.message));
+              return;
+            }
 
             if (hasFlow) {
               const agent = flowAgent;
@@ -573,13 +588,13 @@ class VoiceAutomationService extends EventEmitter {
           this.endStream(streamSid);
           break;
       }
-    });
+    }));
 
-    ws.on('close', () => {
+    ws.on('close', () => runWithUsage(usage, () => {
       console.log('Media Stream WebSocket closed');
       // Plivo does not always send a 'stop' event, so clean up on close too.
       if (streamSid) this.endStream(streamSid);
-    });
+    }));
 
     ws.on('error', (err) => {
       console.error('Twilio Media Stream WebSocket error:', err.message);
@@ -968,6 +983,7 @@ class VoiceAutomationService extends EventEmitter {
       else if (flowId && flowId !== 'undefined' && flowId !== 'null' && db.mongoose.Types.ObjectId.isValid(flowId)) agent = await Agent.findOne({ flow_id: flowId });
 
       const provider = agent?.voice_provider || (agent?.telephony_provider?.startsWith('deepgram') ? 'deepgram' : (agent?.telephony_provider?.startsWith('sarvam_ai') ? 'sarvam_ai' : 'elevenlabs'));
+      recordUsage({ stt_provider: provider, stt_seconds: buffer.length / 8000 });
 
       const noiseTokens = ['[background noise]', '[pause]', '[laughs]', '[clicking]', '[phone ringing]', '[phone beeping]', '[outro jingle]', '[silence]', '[phone hangs up]', '[phone hanging up]', '[phone clicks]'];
 
@@ -1054,6 +1070,7 @@ class VoiceAutomationService extends EventEmitter {
       }
 
       const cacheAndSend = (base64Audio) => {
+        recordUsage({ tts_provider: activeProvider, tts_characters: text.length });
         if (this.ttsAudioCache) {
           if (this.ttsAudioCache.size >= 300) {
             const oldestKey = this.ttsAudioCache.keys().next().value;

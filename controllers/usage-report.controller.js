@@ -1,11 +1,19 @@
 'use strict';
 
 const { db } = require('../models');
-const { Call, User, CreditUsage, Setting, SMSLog, SmsMessage, WhatsAppLog } = db;
+const { Call, User, CreditUsage, Plan, Setting, SMSLog, SmsMessage, WhatsAppLog } = db;
 
-const { callCost } = require('../utils/callCost');
+const { callCost, typicalMinuteCost } = require('../utils/callCost');
+const creditService = require('../services/creditService');
 
 const round2 = (n) => Math.round(n * 100) / 100;
+const sum = (obj) => Object.values(obj).reduce((a, b) => a + b, 0);
+const isAdminRequest = (req) => ['super_admin', 'admin'].includes(req.user.roleId?.name);
+
+const VOICE_PROVIDERS = ['deepgram', 'sarvam_ai', 'elevenlabs'];
+// Real calls replace the estimate once a voice has this many tracked calls in the window.
+const MIN_MEASURED_CALLS = 10;
+const MEASURE_DAYS = 30;
 
 const emptyRow = () => ({
   calls: 0, minutes: 0, credits_used: 0, sms: 0, whatsapp: 0,
@@ -17,8 +25,7 @@ const emptyRow = () => ({
 // Per client: what they used, what it cost you, what their credits earned you, and the profit.
 exports.getUsageReport = async (req, res) => {
   try {
-    const role = req.user.roleId?.name;
-    if (role !== 'super_admin' && role !== 'admin') {
+    if (!isAdminRequest(req)) {
       return res.status(403).json({ success: false, message: 'Only admins can view the cost report' });
     }
 
@@ -158,3 +165,93 @@ exports.getUsageReport = async (req, res) => {
   }
 };
 
+// GET /api/usage-report/credit-cost
+// What one credit costs you for each voice and message type, and what each plan charges for one.
+// Plans priced above cost_per_credit (the highest of these) never run at a loss.
+exports.getCreditCost = async (req, res) => {
+  try {
+    if (!isAdminRequest(req)) {
+      return res.status(403).json({ success: false, message: 'Only admins can view credit costs' });
+    }
+
+    // Not lean, so rates missing from the stored document get their schema defaults.
+    const settings = (await Setting.findOne()) || new Setting();
+
+    // Real cost per credit from the last 30 days of calls with recorded usage.
+    const since = new Date(Date.now() - MEASURE_DAYS * 24 * 60 * 60 * 1000);
+    const calls = await Call.find({ created_at: { $gte: since }, duration: { $gt: 0 }, 'usage.telephony_provider': { $ne: null } })
+      .select('duration usage agent_id')
+      .populate('agent_id', 'voice_provider')
+      .lean();
+    const measured = {};
+    for (const call of calls) {
+      const voice = call.agent_id?.voice_provider || call.usage.tts_provider || call.usage.stt_provider;
+      if (!VOICE_PROVIDERS.includes(voice)) continue;
+      if (!measured[voice]) measured[voice] = { calls: 0, cost: 0, credits: 0 };
+      measured[voice].calls += 1;
+      measured[voice].cost += sum(callCost(call, settings));
+      measured[voice].credits += creditService.creditsForCall(settings, call.duration, voice);
+    }
+
+    const voices = VOICE_PROVIDERS.map((provider) => {
+      // Credits a one-minute call uses; in per-call mode, the credits for one call.
+      const creditsPerMinute = creditService.creditsForCall(settings, 60, provider);
+      const estimated = typicalMinuteCost(settings, provider) / creditsPerMinute;
+      const m = measured[provider];
+      const real = m && m.calls >= MIN_MEASURED_CALLS && m.credits > 0 ? m.cost / m.credits : null;
+      return {
+        provider,
+        credits_per_minute: creditsPerMinute,
+        estimated_cost_per_credit: round2(estimated),
+        measured_calls: m?.calls || 0,
+        measured_cost_per_credit: real === null ? null : round2(real),
+        cost_per_credit: round2(real ?? estimated),
+      };
+    });
+
+    // Messages charged in credits: the provider's price spread over the credits each one uses.
+    const messageCost = (creditsKey, costKey) => {
+      const credits = settings[creditsKey] || 0;
+      if (credits <= 0) return null;
+      const cost = settings[costKey] || 0;
+      return { credits_per_message: credits, cost_per_message: cost, cost_per_credit: round2(cost / credits) };
+    };
+    const sms = messageCost('credits_per_sms', 'cost_sms_per_message');
+    const whatsapp = messageCost('credits_per_whatsapp_message', 'cost_whatsapp_per_message');
+
+    const costPerCredit = Math.max(...voices.map((v) => v.cost_per_credit), sms?.cost_per_credit || 0, whatsapp?.cost_per_credit || 0);
+
+    const plans = await Plan.find({ status: 'active', total_credits: { $gt: 0 } })
+      .select('name amount total_credits plan_type billing_cycle visibility')
+      .sort({ amount: 1 })
+      .lean();
+
+    res.json({
+      success: true,
+      deduction_type: settings.credit_deduction_type,
+      measure_days: MEASURE_DAYS,
+      min_measured_calls: MIN_MEASURED_CALLS,
+      voices,
+      sms,
+      whatsapp,
+      cost_per_credit: costPerCredit,
+      plans: plans.map((plan) => {
+        const price = (plan.amount || 0) / plan.total_credits;
+        return {
+          id: String(plan._id),
+          name: plan.name,
+          amount: plan.amount || 0,
+          total_credits: plan.total_credits,
+          plan_type: plan.plan_type,
+          billing_cycle: plan.billing_cycle,
+          visibility: plan.visibility,
+          price_per_credit: round2(price),
+          margin_percent: price > 0 ? round2(((price - costPerCredit) / price) * 100) : null,
+        };
+      }),
+    });
+  } catch (error) {
+    console.error('Credit cost error:', error);
+    res.status(500).json({ success: false, message: 'Failed to work out the credit cost' });
+  }
+};

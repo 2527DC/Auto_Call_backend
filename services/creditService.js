@@ -147,6 +147,11 @@ class CreditService {
       throw new Error('System settings not found');
     }
 
+    return this.creditsForCall(settings, callDurationSeconds, voiceProvider);
+  }
+
+  // Credits a call of this length uses under the given settings.
+  creditsForCall(settings, callDurationSeconds, voiceProvider = null) {
     let creditsToDeduct = 0;
 
     if (settings.credit_deduction_type === 'per_minute') {

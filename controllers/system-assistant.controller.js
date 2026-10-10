@@ -4,7 +4,7 @@ const { db } = require('../models');
 const SystemAssistantKnowledge = db.SystemAssistantKnowledge;
 const SystemAssistantConfig = db.SystemAssistantConfig;
 const Setting = db.Setting;
-const UserSetting = db.UserSetting;
+const UserSettings = db.UserSettings;
 const llmService = require('../services/llmService');
 
 const getOrCreateConfig = async () => {
@@ -35,8 +35,8 @@ const resolveAssistantCredentials = async (config, userId) => {
   }
 
   // Fall back to User's own AI settings if server has none
-  if (!apiKey && userId) {
-    const userSettings = await UserSetting.findOne({ user_id: userId }).lean();
+  if (!apiKey && userId && UserSettings) {
+    const userSettings = await UserSettings.findOne({ user: userId }).lean();
     if (userSettings?.ai_api_key) {
       apiKey = userSettings.ai_api_key;
     }

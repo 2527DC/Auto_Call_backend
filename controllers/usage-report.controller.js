@@ -1,7 +1,7 @@
 'use strict';
 
 const { db } = require('../models');
-const { Call, User, CreditUsage, Plan, Setting, SMSLog, SmsMessage, WhatsAppLog } = db;
+const { Call, User, CreditUsage, PaymentHistory, Plan, Role, Setting, SMSLog, SmsMessage, WhatsAppLog } = db;
 
 const { callCost, typicalMinuteCost } = require('../utils/callCost');
 const creditService = require('../services/creditService');
@@ -16,13 +16,14 @@ const MIN_MEASURED_CALLS = 10;
 const MEASURE_DAYS = 30;
 
 const emptyRow = () => ({
-  calls: 0, minutes: 0, credits_used: 0, sms: 0, whatsapp: 0,
+  calls: 0, minutes: 0, credits_used: 0, sms: 0, whatsapp: 0, paid: 0,
   usage: { stt_minutes: 0, tts_characters: 0, llm_tokens: 0 },
   cost: { telephony: 0, stt: 0, tts: 0, llm: 0, sms: 0, whatsapp: 0 },
 });
 
 // GET /api/usage-report?from=YYYY-MM-DD&to=YYYY-MM-DD
 // Per client: what they used, what it cost you, what their credits earned you, and the profit.
+// Every client with a plan is listed, even with no usage in the range.
 exports.getUsageReport = async (req, res) => {
   try {
     if (!isAdminRequest(req)) {
@@ -92,8 +93,19 @@ exports.getUsageReport = async (req, res) => {
       row.cost.whatsapp += w.n * (rates.cost_whatsapp_per_message || 0);
     }
 
+    // Money actually received in the range (plan purchases and top-ups).
+    const payments = await PaymentHistory.aggregate([
+      { $match: { ...inRange, payment_status: 'success', deleted_at: null } },
+      { $group: { _id: '$user_id', paid: { $sum: '$amount' } } },
+    ]);
+    for (const p of payments) rowFor(p._id).paid += p.paid || 0;
+
+    const adminRoles = await Role.find({ name: { $in: ['super_admin', 'admin'] } }).select('_id').lean();
+    const subscribers = await User.find({ plan_id: { $ne: null }, roleId: { $nin: adminRoles.map((r) => r._id) } }).select('_id').lean();
+    for (const u of subscribers) rowFor(u._id);
+
     const users = await User.find({ _id: { $in: [...rows.keys()] } })
-      .select('name email plan_id roleId')
+      .select('name email plan_id roleId total_credits used_credits')
       .populate('plan_id', 'name amount total_credits')
       .populate('roleId', 'name')
       .lean();
@@ -114,6 +126,8 @@ exports.getUsageReport = async (req, res) => {
       clients.push({
         user: { id: userId, name: user?.name || 'Deleted user', email: user?.email || '', is_admin: isAdmin },
         plan: plan ? { name: plan.name, price_per_credit: round2(pricePerCredit) } : null,
+        credits_left: user && !isAdmin ? round2((user.total_credits || 0) - (user.used_credits || 0)) : null,
+        paid: round2(row.paid),
         calls: row.calls,
         minutes: round2(row.minutes),
         credits_used: round2(row.credits_used),
@@ -135,6 +149,7 @@ exports.getUsageReport = async (req, res) => {
       totals.credits_used += row.credits_used;
       totals.sms += row.sms;
       totals.whatsapp += row.whatsapp;
+      totals.paid += row.paid;
       for (const k of Object.keys(row.cost)) totals.cost[k] += row.cost[k];
       totals.revenue += revenue;
       totals.profit += profit;
@@ -153,6 +168,7 @@ exports.getUsageReport = async (req, res) => {
         credits_used: round2(totals.credits_used),
         sms: totals.sms,
         whatsapp: totals.whatsapp,
+        paid: round2(totals.paid),
         cost: { ...Object.fromEntries(Object.entries(totals.cost).map(([k, v]) => [k, round2(v)])), total: round2(totalCost) },
         revenue: round2(totals.revenue),
         profit: round2(totals.profit),

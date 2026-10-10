@@ -18,6 +18,7 @@ const {
 const { generateInvoiceNumber } = require('../utils/invoice-helper');
 const Role = db.Role;
 const { sendNotification } = require('../utils/notificationHelper');
+const { canUsePlan } = require('../utils/planVisibility');
 
 const DEFAULT_PAGE = 1;
 const DEFAULT_LIMIT = 10;
@@ -63,7 +64,7 @@ exports.startTrial = async (req, res) => {
     const { plan_id } = req.body;
 
     const plan = await Plan.findOne({ _id: plan_id, status: 'active', deleted_at: null });
-    if (!plan) {
+    if (!plan || !canUsePlan(plan, req.user)) {
       return res.status(404).json({ success: false, message: 'Plan not found or inactive' });
     }
 
@@ -128,7 +129,7 @@ exports.createStripeSubscription = async (req, res) => {
     }
 
     const plan = await Plan.findOne({ _id: plan_id, status: 'active', deleted_at: null });
-    if (!plan) {
+    if (!plan || !canUsePlan(plan, req.user)) {
       return res.status(404).json({ success: false, message: 'Plan not found or inactive' });
     }
 
@@ -215,7 +216,7 @@ exports.createRazorpaySubscription = async (req, res) => {
     }
 
     const plan = await Plan.findOne({ _id: plan_id, status: 'active', deleted_at: null });
-    if (!plan) {
+    if (!plan || !canUsePlan(plan, req.user)) {
       return res.status(404).json({ success: false, message: 'Plan not found or inactive' });
     }
 
@@ -317,7 +318,7 @@ exports.createPayPalSubscription = async (req, res) => {
     }
 
     const plan = await Plan.findOne({ _id: plan_id, status: 'active', deleted_at: null });
-    if (!plan) {
+    if (!plan || !canUsePlan(plan, req.user)) {
       return res.status(404).json({ success: false, message: 'Plan not found or inactive' });
     }
 
@@ -582,7 +583,7 @@ exports.createManualSubscription = async (req, res) => {
     }
 
     const plan = await Plan.findOne({ _id: plan_id, status: 'active', deleted_at: null });
-    if (!plan) {
+    if (!plan || !canUsePlan(plan, req.user)) {
       return res.status(404).json({ success: false, message: 'Plan not found or inactive' });
     }
 
@@ -798,7 +799,7 @@ exports.changeSubscriptionPlan = async (req, res) => {
     }
 
     const newPlan = await Plan.findOne({ _id: new_plan_id, status: 'active', deleted_at: null });
-    if (!newPlan) {
+    if (!newPlan || !canUsePlan(newPlan, req.user)) {
       return res.status(404).json({ success: false, message: 'New plan not found or inactive' });
     }
 

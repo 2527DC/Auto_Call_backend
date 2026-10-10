@@ -163,3 +163,19 @@ exports.authenticate = async (req, res, next) => {
     return res.status(401).json({ message: 'Token is invalid or expired' });
   }
 };
+
+// For public routes that show more to a logged-in user: a valid login sets
+// req.user, while no credentials or a failed login continue as an anonymous visitor.
+exports.optionalAuthenticate = (req, res, next) => {
+  const hasCredentials = extractApiKeyFromRequest(req) || req.headers.authorization?.startsWith('Bearer ');
+  if (!hasCredentials) return next();
+
+  const asVisitor = {
+    status: () => asVisitor,
+    json: () => {
+      req.user = undefined;
+      next();
+    },
+  };
+  return exports.authenticate(req, asVisitor, next);
+};

@@ -118,6 +118,16 @@ const PlanSchema = new mongoose.Schema(
       enum: ['active', 'inactive'],
       default: 'active',
     },
+    // Private plans are hidden from the public and offered only to the listed clients.
+    visibility: {
+      type: String,
+      enum: ['public', 'private'],
+      default: 'public',
+    },
+    allowed_user_ids: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    }],
     amount: {
       type: Number,
       required: true,

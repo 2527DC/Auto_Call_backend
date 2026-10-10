@@ -1,11 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const planController = require('../controllers/plan.controller');
-const { authenticate } = require('../middlewares/auth');
+const { authenticate, optionalAuthenticate } = require('../middlewares/auth');
 const { checkPermission } = require('../middlewares/permission');
 
-router.get('/', planController.getPlans);
-router.get('/:id', planController.getPlanById);
+router.get('/', optionalAuthenticate, planController.getPlans);
+router.get('/:id', optionalAuthenticate, planController.getPlanById);
 
 router.use(authenticate);
 router.post('/', checkPermission('create.plans'), planController.createPlan);

@@ -13,7 +13,8 @@ const extractId = (val) => {
 
 const getPopulatedLandingPage = () => {
   return LandingPage.findOne()
-    .populate('pricing.plan_ids')
+    // Private plans are for specific clients, so never list them publicly.
+    .populate({ path: 'pricing.plan_ids', match: { visibility: { $ne: 'private' } } })
     .populate({
       path: 'blog.blog_ids',
       select: 'title slug description thumbnail created_at',

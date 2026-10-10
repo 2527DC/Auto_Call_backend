@@ -1,6 +1,13 @@
+const mongoose = require('mongoose');
 const { db } = require('../models');
 const Plan = db.Plan;
+const { isPlanAdmin, visiblePlansFilter, canUsePlan } = require('../utils/planVisibility');
 const { StripeService, RazorpayService, PayPalService } = require('../utils/payment-gateway.service');
+
+// Accepts user ids or populated user objects from the plan form.
+const toUserIds = (list) => (Array.isArray(list) ? list : [])
+  .map((u) => (u && typeof u === 'object' ? u._id || u.id : u))
+  .filter((id) => mongoose.Types.ObjectId.isValid(id));
 
 const _syncPlanInternal = async (plan, force = false) => {
   if (plan.amount <= 0) {
@@ -72,7 +79,7 @@ exports.createPlan = async (req, res) => {
       paypal_plan_id, paypal_plan_id_monthly, paypal_plan_id_yearly, razorpay_plan_id,
       total_credits, is_popular, status, amount, currency, ai_features,
       agent_limit, campaign_limit_per_day, flow_limit, knowledgebase_limit, storage_limit, contact_limit,
-      sms_agent_limit, sms_campaign_limit_per_day, campaign_sms_limit
+      sms_agent_limit, sms_campaign_limit_per_day, campaign_sms_limit, visibility, allowed_user_ids
     } = req.body;
 
     if (!name || !slug || !amount) {
@@ -108,7 +115,9 @@ exports.createPlan = async (req, res) => {
       contact_limit,
       sms_agent_limit,
       sms_campaign_limit_per_day,
-      campaign_sms_limit
+      campaign_sms_limit,
+      visibility,
+      allowed_user_ids: toUserIds(allowed_user_ids)
     });
 
     await plan.save();
@@ -131,10 +140,13 @@ exports.createPlan = async (req, res) => {
 exports.getPlans = async (req, res) => {
   try {
     const { status } = req.query;
-    const query = {};
+    const query = visiblePlansFilter(req.user);
     if (status) query.status = status;
 
-    const plans = await Plan.find(query).sort({ created_at: -1 });
+    // Only admins see which clients a private plan is offered to.
+    const plans = isPlanAdmin(req.user)
+      ? await Plan.find(query).sort({ created_at: -1 }).populate('allowed_user_ids', 'name email')
+      : await Plan.find(query).sort({ created_at: -1 }).select('-allowed_user_ids');
     res.status(200).json(plans);
   } catch (error) {
     console.error('Get Plans error:', error);
@@ -144,11 +156,16 @@ exports.getPlans = async (req, res) => {
 
 exports.getPlanById = async (req, res) => {
   try {
-    const plan = await Plan.findById(req.params.id);
-    if (!plan) {
+    const admin = isPlanAdmin(req.user);
+    const plan = admin
+      ? await Plan.findById(req.params.id).populate('allowed_user_ids', 'name email')
+      : await Plan.findById(req.params.id);
+    if (!plan || !canUsePlan(plan, req.user)) {
       return res.status(404).json({ message: 'Plan not found.' });
     }
-    res.status(200).json(plan);
+    const body = plan.toJSON();
+    if (!admin) delete body.allowed_user_ids;
+    res.status(200).json(body);
   } catch (error) {
     console.error('Get Plan error:', error);
     res.status(500).json({ message: 'Internal server error' });
@@ -163,7 +180,7 @@ exports.updatePlan = async (req, res) => {
       paypal_plan_id, paypal_plan_id_monthly, paypal_plan_id_yearly, razorpay_plan_id,
       total_credits, is_popular, status, amount, currency, ai_features,
       agent_limit, campaign_limit_per_day, flow_limit, knowledgebase_limit, storage_limit, contact_limit,
-      sms_agent_limit, sms_campaign_limit_per_day, campaign_sms_limit
+      sms_agent_limit, sms_campaign_limit_per_day, campaign_sms_limit, visibility, allowed_user_ids
     } = req.body;
 
     const plan = await Plan.findById(req.params.id);
@@ -200,6 +217,8 @@ exports.updatePlan = async (req, res) => {
     if (sms_agent_limit !== undefined) plan.sms_agent_limit = sms_agent_limit;
     if (sms_campaign_limit_per_day !== undefined) plan.sms_campaign_limit_per_day = sms_campaign_limit_per_day;
     if (campaign_sms_limit !== undefined) plan.campaign_sms_limit = campaign_sms_limit;
+    if (visibility) plan.visibility = visibility;
+    if (allowed_user_ids !== undefined) plan.allowed_user_ids = toUserIds(allowed_user_ids);
 
     await plan.save();
 

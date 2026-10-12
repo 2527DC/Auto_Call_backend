@@ -607,6 +607,29 @@ const modules = {
     roles: {
       ADMIN: ['view', 'manage'],
     }
+  },
+  whatsappInbox: {
+    actions: {
+      view: 'view.whatsapp_inbox',
+      reply: 'reply.whatsapp_inbox',
+      assign: 'assign.whatsapp_inbox',
+    },
+    roles: {
+      ADMIN: ['view', 'reply', 'assign'],
+      USER: ['view', 'reply', 'assign'],
+    }
+  },
+  whatsappAutomation: {
+    actions: {
+      view: 'view.whatsapp_automation',
+      create: 'create.whatsapp_automation',
+      update: 'update.whatsapp_automation',
+      delete: 'delete.whatsapp_automation',
+    },
+    roles: {
+      ADMIN: ['view', 'create', 'update', 'delete'],
+      USER: ['view', 'create', 'update', 'delete'],
+    }
   }
 };
 

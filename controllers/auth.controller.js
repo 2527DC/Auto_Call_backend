@@ -802,7 +802,8 @@ exports.teamMemberLogin = async (req, res) => {
       team_id: member.team_id,
       isTeamMember: true,
       role: 'team_member',
-      permissionSlugs
+      permissionSlugs,
+      beta_features: { whatsapp: !!(await User.findById(member.user_id).select('beta_features').lean())?.beta_features?.whatsapp }
     };
 
     return res.status(200).json({ success: true, message: 'Login successful!', token, user: userProfile });
@@ -823,7 +824,7 @@ exports.getTeamMemberProfile = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Team not found or inactive.' });
     }
     const member = await TeamMember.findOne({ _id: req.user._id, team_id: team._id })
-      .populate('user_id', 'name email')
+      .populate('user_id', 'name email beta_features')
       .select('-password');
     if (!member) {
       return res.status(404).json({ success: false, message: 'Team member not found in this team.' });
@@ -858,7 +859,8 @@ exports.getTeamMemberProfile = async (req, res) => {
       },
       isTeamMember: true,
       role: 'team_member',
-      permissionSlugs
+      permissionSlugs,
+      beta_features: { whatsapp: !!member.user_id.beta_features?.whatsapp }
     };
 
     return res.status(200).json({

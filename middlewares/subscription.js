@@ -33,6 +33,11 @@ const SUBSCRIPTION_FREE_PERMISSIONS = new Set([
   'update.subscriptions',
   'update.user_settings',
   'export.contacts',
+  // WhatsApp inbox and automation are free while in beta.
+  'reply.whatsapp_inbox',
+  'assign.whatsapp_inbox',
+  'create.whatsapp_automation',
+  'update.whatsapp_automation',
 ]);
 
 const permissionNeedsSubscription = (permissionSlug) => {

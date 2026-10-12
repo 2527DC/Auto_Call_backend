@@ -1,4 +1,4 @@
-const whatsappCallAutomationService = require('../services/whatsappCallAutomationService');
+const whatsappService = require('../services/whatsappService');
 
 exports.webhook = async (req, res) => {
   if (req.method === 'GET') {
@@ -12,22 +12,13 @@ exports.webhook = async (req, res) => {
     return res.status(403).end();
   }
 
+  // The same handler as /api/whatsapp/webhook, so this URL also receives
+  // messages and delivery statuses when it is the one set in the Meta app.
+  res.status(200).end();
   try {
-    const payload = req.body;
-    const entry = payload.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value;
-
-    if (value?.calls) {
-      const phoneNumberId = value.metadata?.phone_number_id;
-      for (const callObj of value.calls) {
-        await whatsappCallAutomationService.handleCallWebhook(callObj, phoneNumberId);
-      }
-    }
-
-    res.status(200).end();
+    const trusted = await whatsappService.verifySignature(req);
+    await whatsappService.handleWebhook(req.body, { trusted });
   } catch (error) {
     console.error('WhatsApp Call Webhook Error:', error.message);
-    res.status(500).end();
   }
 };

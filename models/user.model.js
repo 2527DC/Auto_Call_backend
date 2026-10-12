@@ -65,6 +65,10 @@ const UserSchema = new Schema(
       type: Boolean, 
       default: false 
     },
+    // Features in beta, switched on per client by an admin.
+    beta_features: {
+      whatsapp: { type: Boolean, default: false }
+    },
     last_seen: { 
       type: Date, 
       default: null 

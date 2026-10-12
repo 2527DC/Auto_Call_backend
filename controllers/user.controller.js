@@ -81,6 +81,7 @@ exports.getAllUsers = async (req, res) => {
             roleId: 1,
             lastLogin: 1,
             isActive: 1,
+            beta_features: 1,
             created_at: 1,
             role: '$roleInfo.name'
           }
@@ -211,7 +212,7 @@ exports.createUser = async (req, res) => {
 };
 
 exports.updateUser = async (req, res) => {
-  const { name, email, id, roleId, isActive, remove_avatar } = req.body;
+  const { name, email, id, roleId, isActive, remove_avatar, beta_whatsapp } = req.body;
 
   try {
     const user = await User.findById(id);
@@ -261,12 +262,13 @@ exports.updateUser = async (req, res) => {
       updateData.roleId = roleId;
     }
     if (isActive !== undefined) updateData.isActive = isActive === 'true' || isActive === true;
+    if (beta_whatsapp !== undefined) updateData['beta_features.whatsapp'] = beta_whatsapp === 'true' || beta_whatsapp === true;
 
     await User.updateOne({ _id: id }, { $set: updateData });
 
     const updatedUser = await User.findById(id)
       .populate('roleId', 'name')
-      .select('id avatar name email roleId isActive');
+      .select('id avatar name email roleId isActive beta_features');
 
     const formattedUser = {
       ...updatedUser.toObject(),

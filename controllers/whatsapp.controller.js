@@ -2,6 +2,7 @@ const { db } = require('../models');
 const { WhatsappWaba, WhatsappPhoneNumber, WhatsAppTemplate, UserSettings } = db;
 const axios = require('axios');
 const whatsappService = require('../services/whatsappService');
+const meta = require('../services/whatsapp/meta');
 
 const API_VERSION = 'v21.0';
 
@@ -69,6 +70,7 @@ exports.handleEmbeddedSignup = async (req, res) => {
     );
 
     await whatsappService.syncTemplatesFromMeta(userId);
+    await meta.subscribeApp(finalSignupData.waba_id, accessToken).catch((e) => console.warn('[WhatsApp] Webhook subscribe failed:', e.message));
 
     res.json({ success: true, data: waba });
   } catch (error) {
@@ -184,6 +186,7 @@ exports.manualConnect = async (req, res) => {
     );
 
     await whatsappService.syncTemplatesFromMeta(userId);
+    await meta.subscribeApp(waba_id, access_token).catch((e) => console.warn('[WhatsApp] Webhook subscribe failed:', e.message));
 
     res.json({ success: true, data: waba });
   } catch (error) {
@@ -204,11 +207,12 @@ exports.webhook = async (req, res) => {
     return res.status(403).end();
   }
 
+  // Meta wants a quick 200; the work happens after, and Meta's retries are de-duplicated.
+  res.status(200).end();
   try {
-    await whatsappService.handleWebhook(req.body);
-    res.status(200).end();
+    const trusted = await whatsappService.verifySignature(req);
+    await whatsappService.handleWebhook(req.body, { trusted });
   } catch (error) {
     console.error('Webhook Error:', error.message);
-    res.status(500).end();
   }
 };

@@ -59,7 +59,13 @@ app.use((req, res, next) => {
   if (req.originalUrl.includes('/webhook/stripe') || req.originalUrl.includes('/webhook/paypal')) {
     next();
   } else {
-    express.json({ limit: '50mb' })(req, res, next);
+    // Webhooks keep the raw body so their signatures can be checked.
+    express.json({
+      limit: '50mb',
+      verify: (request, response, buf) => {
+        if (request.originalUrl.includes('/webhook')) request.rawBody = buf;
+      },
+    })(req, res, next);
   }
 });
 app.use((req, res, next) => {
@@ -117,6 +123,8 @@ const dashboardRoutes = require('./routes/dashboard.routes');
 const landingPageRoutes = require('./routes/landing-page.routes');
 const usageReportRoutes = require('./routes/usage-report.routes');
 const priceEstimatorRoutes = require('./routes/price-estimator.routes');
+const whatsappInboxRoutes = require('./routes/whatsapp-inbox.routes');
+const whatsappAutomationRoutes = require('./routes/whatsapp-automation.routes');
 const uploadRoutes = require('./routes/upload.routes');
 const apiKeyRoutes = require('./routes/api-key.routers');
 const googleRoutes = require('./routes/google.routes');
@@ -192,6 +200,8 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/landing-page', landingPageRoutes);
 app.use('/api/usage-report', usageReportRoutes);
 app.use('/api/price-estimator', priceEstimatorRoutes);
+app.use('/api/whatsapp-inbox', whatsappInboxRoutes);
+app.use('/api/whatsapp-automations', whatsappAutomationRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/api-keys', apiKeyRoutes)
 app.use('/api/tenant-guide', tenantGuideRoutes)

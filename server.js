@@ -5,6 +5,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const deleteExpiredOtp = require('./cron/deleteExpiredOtps');
 const { initTopUpExpiryCron } = require('./cron/topup-expiry.cron');
+const whatsappFlowSweeper = require('./cron/whatsappFlowSweeper');
 
 const PORT = process.env.PORT || 3000;
 
@@ -33,11 +34,24 @@ const PORT = process.env.PORT || 3000;
 
     deleteExpiredOtp.start();
     initTopUpExpiryCron();
+    whatsappFlowSweeper.start();
 
     app.set('io', io);
+    require('./utils/realtime').attach(io);
 
+    // Call media streams connect at "/". Socket.io handles its own upgrades at
+    // /socket.io; letting ws see those too broke the socket.io handshake.
     const { WebSocketServer } = require('ws');
-    const wss = new WebSocketServer({ server, path: '/' });
+    const wss = new WebSocketServer({ noServer: true });
+    server.on('upgrade', (req, socket, head) => {
+      const pathname = (req.url || '').split('?')[0];
+      if (pathname.startsWith('/socket.io')) return;
+      if (pathname !== '/') {
+        socket.destroy();
+        return;
+      }
+      wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    });
     const voiceAutomationService = require('./services/voiceAutomationService');
     voiceAutomationService.setIo(io);
 

@@ -74,6 +74,7 @@ const formatUser = (user) => {
     isVerified: user.isVerified,
     isOnline: user.isOnline,
     lastLogin: user.lastLogin,
+    beta_features: { whatsapp: !!user.beta_features?.whatsapp },
     total_credits,
     used_credits,
     remaining_credits: Math.max(0, total_credits - used_credits),

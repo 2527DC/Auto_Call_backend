@@ -16,6 +16,7 @@ const FormData = require('form-data');
 const webhookDispatcher = require('../services/webhookDispatcher');
 const plivoService = require('../services/plivoService');
 const deepgramService = require('../services/deepgramService');
+const outboundCallService = require('../services/outboundCallService');
 
 exports.placeCall = async (req, res) => {
   try {
@@ -27,136 +28,13 @@ exports.placeCall = async (req, res) => {
       return res.status(400).json({ success: false, message: 'flowId, phoneNumber, and fromNumber are required' });
     }
 
-    const contact = await Contact.findOne({ user_id: userId, phone_number: phoneNumber });
-    if (contact && contact.is_blocked) {
-      return res.status(403).json({ success: false, message: 'This contact is blocked due to policy violations.' });
-    }
-
-    let agent;
-    if (agentId) {
-      agent = await Agent.findById(agentId);
-      if (!agent) {
-        return res.status(404).json({ success: false, message: 'Selected agent not found' });
-      }
-    } else {
-      agent = await Agent.findOne({ flow_id: flowId, type: 'flow', status: 'active' });
-    }
-    if (!agent) {
-      return res.status(400).json({
-        success: false,
-        message: 'This flow is not assigned to any active AI flow agent. Please assign a flow agent to the flow before placing a call.'
-      });
-    }
-
-    const settings = await UserSettings.findOne({ user: userId });
-    if (!settings) {
-      return res.status(400).json({ success: false, message: 'User settings not found' });
-    }
-
-    const appUrl = process.env.APP_URL;
-    if (!appUrl) {
-      return res.status(500).json({ success: false, message: 'APP_URL not configured' });
-    }
-
-    const sourceNumber = await PhoneNumber.findOne({ phone_number: fromNumber });
-    if (!sourceNumber) {
-      return res.status(404).json({ success: false, message: 'Source phone number not found in your account' });
-    }
     const isAdmin = req.user.roleId.name === 'super_admin' || req.user.roleId.name === 'admin';
-    if (!isAdmin && sourceNumber.user_id && sourceNumber.user_id.toString() !== userId.toString()) {
-      return res.status(404).json({ success: false, message: 'Source phone number not found in your account' });
-    }
-
-    if (!(await creditService.hasCredits(userId))) {
-      return res.status(402).json({ success: false, message: 'Insufficient credits. Please top up to place calls.' });
-    }
-
     let callLog;
-
-    if (sourceNumber.type === 'sip' && sourceNumber.elevenlabs_phone_number_id && agent.elevenlabs_agent_id) {
-      if (!settings.elevenlabs_api_key) {
-        return res.status(400).json({ success: false, message: 'ElevenLabs API key not configured' });
-      }
-
-      const sipResponse = await elevenLabsService.makeSipOutboundCall(
-        agent.elevenlabs_agent_id,
-        sourceNumber.elevenlabs_phone_number_id,
-        phoneNumber,
-        settings.elevenlabs_api_key
-      );
-
-      callLog = await Call.create({
-        user_id: userId,
-        flow_id: flowId,
-        agent_id: agent._id,
-        twilio_call_sid: sipResponse.sip_call_id || sipResponse.conversation_id || `sip_${Date.now()}`,
-        from_number: fromNumber,
-        to_number: phoneNumber,
-        status: 'queued',
-        direction: 'outbound',
-        contact_id: contact ? contact._id : null
-      });
-      webhookDispatcher.dispatchEvent(userId, 'Call Initiated', callLog);
-    } else if (sourceNumber.provider === 'plivo' || sourceNumber.type === 'sip') {
-      const authId = settings.plivo_auth_id || process.env.PLIVO_AUTH_ID;
-      const authToken = settings.plivo_auth_token || process.env.PLIVO_AUTH_TOKEN;
-      if (!authId || !authToken) {
-        return res.status(400).json({ success: false, message: 'Plivo settings not configured' });
-      }
-
-      const xmlUrl = `${appUrl}/api/calls/plivo-xml?flowId=${flowId}&userId=${userId}&agentId=${agent._id.toString()}`;
-      const statusCallbackUrl = `${appUrl}/api/calls/plivo-status`;
-
-      const plivoCall = await plivoService.makeCall(
-        authId,
-        authToken,
-        fromNumber,
-        phoneNumber,
-        xmlUrl,
-        statusCallbackUrl
-      );
-
-      callLog = await Call.create({
-        user_id: userId,
-        flow_id: flowId,
-        agent_id: agent._id,
-        twilio_call_sid: plivoCall.requestUuid,
-        from_number: fromNumber,
-        to_number: phoneNumber,
-        status: 'queued',
-        direction: 'outbound',
-        contact_id: contact ? contact._id : null
-      });
-      webhookDispatcher.dispatchEvent(userId, 'Call Initiated', callLog);
-    } else {
-      if (!settings.twilio_account_sid || !settings.twilio_auth_token) {
-        return res.status(400).json({ success: false, message: 'Twilio settings not configured' });
-      }
-
-      const twimlUrl = `${appUrl}/api/calls/twiml?flowId=${flowId}&userId=${userId}&agentId=${agent._id.toString()}`;
-      const statusCallbackUrl = `${appUrl}/api/calls/status`;
-
-      const twilioCall = await twilioService.makeCall(
-        settings.twilio_account_sid,
-        settings.twilio_auth_token,
-        fromNumber,
-        phoneNumber,
-        twimlUrl,
-        statusCallbackUrl
-      );
-
-      callLog = await Call.create({
-        user_id: userId,
-        flow_id: flowId,
-        agent_id: agent._id,
-        twilio_call_sid: twilioCall.sid,
-        from_number: fromNumber,
-        to_number: phoneNumber,
-        status: twilioCall.status || 'queued',
-        direction: 'outbound',
-        contact_id: contact ? contact._id : null
-      });
-      webhookDispatcher.dispatchEvent(userId, 'Call Initiated', callLog);
+    try {
+      callLog = await outboundCallService.placeCall({ userId, isAdmin, flowId, agentId, phoneNumber, fromNumber });
+    } catch (err) {
+      if (err.status) return res.status(err.status).json({ success: false, message: err.message });
+      throw err;
     }
 
     const creditBalance = await creditService.getCreditBalance(userId);

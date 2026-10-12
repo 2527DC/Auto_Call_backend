@@ -10,6 +10,18 @@ const { Permission, Role, RolePermission } = db;
 const NEW_PERMISSIONS = [
   { slug: 'view.price_estimator', name: 'View Price_estimator', description: 'Permission to view price_estimator', roles: ['super_admin', 'admin'] },
   { slug: 'manage.price_estimator', name: 'Manage Price_estimator', description: 'Permission to manage price_estimator', roles: ['super_admin', 'admin'] },
+  ...['view', 'reply', 'assign'].map((action) => ({
+    slug: `${action}.whatsapp_inbox`,
+    name: `${action[0].toUpperCase()}${action.slice(1)} Whatsapp_inbox`,
+    description: `Permission to ${action} whatsapp_inbox`,
+    roles: ['super_admin', 'admin', 'user'],
+  })),
+  ...['view', 'create', 'update', 'delete'].map((action) => ({
+    slug: `${action}.whatsapp_automation`,
+    name: `${action[0].toUpperCase()}${action.slice(1)} Whatsapp_automation`,
+    description: `Permission to ${action} whatsapp_automation`,
+    roles: ['super_admin', 'admin', 'user'],
+  })),
 ];
 
 const ensurePermissions = async () => {

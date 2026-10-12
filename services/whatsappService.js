@@ -1,7 +1,8 @@
 const axios = require('axios');
+const crypto = require('crypto');
 const { db } = require('../models');
 const creditService = require('./creditService');
-const { WhatsappWaba, WhatsAppTemplate, WhatsAppLog, WhatsappPhoneNumber } = db;
+const { WhatsappWaba, WhatsAppTemplate, WhatsAppLog, WhatsappPhoneNumber, UserSettings } = db;
 
 const API_VERSION = 'v21.0';
 
@@ -175,20 +176,69 @@ class WhatsAppService {
   }
 
   /**
-   * Handle Webhook events (Status Updates)
+   * Checks Meta's X-Hub-Signature-256 against the app secrets of the numbers in
+   * the payload (and META_APP_SECRET). Returns true when no secret is set to check against.
    */
-  async handleWebhook(payload) {
-    const entry = payload.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value;
+  async verifySignature(req) {
+    const phoneIds = new Set();
+    for (const entry of req.body?.entry || []) {
+      for (const change of entry.changes || []) {
+        if (change.value?.metadata?.phone_number_id) phoneIds.add(change.value.metadata.phone_number_id);
+      }
+    }
+    const phones = await WhatsappPhoneNumber.find({ whatsapp_phone_number_id: { $in: [...phoneIds] } }).select('user_id').lean();
+    const settings = await UserSettings.find({ user: { $in: phones.map((p) => p.user_id) }, whatsapp_app_secret: { $nin: [null, ''] } })
+      .select('whatsapp_app_secret')
+      .lean();
+    const secrets = [process.env.META_APP_SECRET, ...settings.map((s) => s.whatsapp_app_secret)].filter(Boolean);
+    if (!secrets.length) return true;
 
-    if (value?.statuses) {
-      for (const statusObj of value.statuses) {
-        const { id, status, timestamp, recipient_id } = statusObj;
-        await WhatsAppLog.findOneAndUpdate(
-          { message_sid: id },
-          { $set: { status: status } }
-        );
+    const signature = req.get('x-hub-signature-256') || '';
+    if (!signature || !req.rawBody) return false;
+    return secrets.some((secret) => {
+      const expected = `sha256=${crypto.createHmac('sha256', secret).update(req.rawBody).digest('hex')}`;
+      return expected.length === signature.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+    });
+  }
+
+  /**
+   * Handle webhook events: delivery statuses, customer messages (WhatsApp inbox
+   * beta) and calls. Meta sends all of them to the one callback URL of the app.
+   * Messages are only handled when the signature checked out.
+   */
+  async handleWebhook(payload, { trusted = true } = {}) {
+    const inbox = require('./whatsapp/inbox');
+    const flowEngine = require('./whatsapp/flowEngine');
+    const whatsappCallAutomationService = require('./whatsappCallAutomationService');
+
+    for (const entry of payload?.entry || []) {
+      for (const change of entry.changes || []) {
+        const value = change.value || {};
+
+        for (const statusObj of value.statuses || []) {
+          await WhatsAppLog.findOneAndUpdate(
+            { message_sid: statusObj.id },
+            { $set: { status: statusObj.status } }
+          );
+          await inbox.applyStatus(statusObj).catch((e) => console.error('[WhatsApp] Status update failed:', e.message));
+        }
+
+        if (value.messages?.length && !trusted) {
+          console.warn(`[WhatsApp] Webhook signature check failed for number ${value.metadata?.phone_number_id}; incoming messages ignored. Check the Meta App Secret in Settings.`);
+        } else {
+          for (const msg of value.messages || []) {
+            try {
+              const result = await inbox.ingestInbound(value, msg);
+              if (result) flowEngine.handleInbound(result);
+            } catch (e) {
+              console.error('[WhatsApp] Incoming message failed:', e);
+            }
+          }
+        }
+
+        for (const callObj of value.calls || []) {
+          await whatsappCallAutomationService.handleCallWebhook(callObj, value.metadata?.phone_number_id);
+        }
       }
     }
   }

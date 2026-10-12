@@ -18,10 +18,16 @@ const callCost = (call, rates) => {
   };
 };
 
-// A typical minute of an AI call (docs/understanding/calling_cost_and_providers.md):
-// the caller speaks about 30 seconds, the agent about 450 characters, and the AI
-// model reads about 10,000 tokens and writes about 240.
-const TYPICAL_MINUTE = { stt_seconds: 30, tts_characters: 450, llm_input_tokens: 10000, llm_output_tokens: 240 };
+// One minute of an AI call (docs/understanding/calling_cost_and_providers.md).
+// Typical: the caller speaks about 30 seconds, the agent about 450 characters, and
+// the AI model reads about 10,000 tokens and writes about 240. Heavy: the agent
+// talks most of the minute and a large knowledge base goes with every turn.
+const USAGE_PROFILES = {
+  light: { stt_seconds: 24, tts_characters: 350, llm_input_tokens: 6500, llm_output_tokens: 150 },
+  typical: { stt_seconds: 30, tts_characters: 450, llm_input_tokens: 10000, llm_output_tokens: 240 },
+  heavy: { stt_seconds: 60, tts_characters: 700, llm_input_tokens: 40000, llm_output_tokens: 500 },
+};
+const TYPICAL_MINUTE = USAGE_PROFILES.typical;
 
 // What a typical one-minute Plivo call costs with this voice. Speech-to-text uses the same provider.
 const typicalMinuteCost = (rates, voiceProvider) => {
@@ -29,4 +35,4 @@ const typicalMinuteCost = (rates, voiceProvider) => {
   return Object.values(callCost({ duration: 60, usage }, rates)).reduce((a, b) => a + b, 0);
 };
 
-module.exports = { billedMinutes, callCost, typicalMinuteCost };
+module.exports = { billedMinutes, callCost, typicalMinuteCost, USAGE_PROFILES };

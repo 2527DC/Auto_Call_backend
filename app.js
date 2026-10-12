@@ -8,6 +8,7 @@ const path = require('path');
 const dotenv = require('dotenv');
 const session = require('express-session');
 const connectDB = require('./config/db');
+const { ensurePermissions } = require('./utils/ensurePermissions');
 require('./config/passport');
 const app = express();
 dotenv.config();
@@ -30,6 +31,7 @@ app.use(require('passport').initialize());
 
 connectDB().then(() => {
   console.log('Database connected.');
+  ensurePermissions().catch((err) => console.error('Failed to add new permissions:', err));
 });
 
 app.use(
@@ -114,6 +116,7 @@ const automationRoutes = require('./routes/automation.routes');
 const dashboardRoutes = require('./routes/dashboard.routes');
 const landingPageRoutes = require('./routes/landing-page.routes');
 const usageReportRoutes = require('./routes/usage-report.routes');
+const priceEstimatorRoutes = require('./routes/price-estimator.routes');
 const uploadRoutes = require('./routes/upload.routes');
 const apiKeyRoutes = require('./routes/api-key.routers');
 const googleRoutes = require('./routes/google.routes');
@@ -188,6 +191,7 @@ app.use('/api/automation', automationRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/landing-page', landingPageRoutes);
 app.use('/api/usage-report', usageReportRoutes);
+app.use('/api/price-estimator', priceEstimatorRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/api-keys', apiKeyRoutes)
 app.use('/api/tenant-guide', tenantGuideRoutes)

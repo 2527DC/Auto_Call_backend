@@ -598,6 +598,15 @@ const modules = {
     roles: {
       ADMIN: ['view', 'start'],
     }
+  },
+  priceEstimator: {
+    actions: {
+      view: 'view.price_estimator',
+      manage: 'manage.price_estimator',
+    },
+    roles: {
+      ADMIN: ['view', 'manage'],
+    }
   }
 };
 

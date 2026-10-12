@@ -20,63 +20,181 @@ const SMSCampaign = db.SMSCampaign;
 const TeamMember = db.TeamMember;
 const creditService = require('../services/creditService');
 
+const Plan = db.Plan;
+const { buildPeriod, bucketKey, listBuckets } = require('../utils/dashboardPeriod');
+
+// Counter filters use the same Indian-time periods as the charts.
 const buildDateRange = (dateRange, startDate, endDate) => {
-  if (!dateRange) {
-    return null;
+  const period = buildPeriod(dateRange, startDate, endDate);
+  return period && { start: period.start, end: period.end };
+};
+
+const round2 = (n) => Math.round((n || 0) * 100) / 100;
+const between = (from, to) => ({ $gte: from, $lte: to });
+const countIf = (expr) => ({ $sum: { $cond: [expr, 1, 0] } });
+const byKey = (rows) => new Map(rows.map((row) => [row._id, row]));
+
+// Call counts per chart bucket (or one total row when bucket is null).
+const callGroup = (bucket) => ({
+  $group: {
+    _id: bucket ? bucketKey('$created_at', bucket) : null,
+    calls: { $sum: 1 },
+    inbound: countIf({ $eq: ['$direction', 'inbound'] }),
+    outbound: countIf({ $eq: ['$direction', 'outbound'] }),
+    completed: countIf({ $eq: ['$status', 'completed'] }),
+    seconds: { $sum: { $ifNull: ['$duration', 0] } }
+  }
+});
+
+const callTotals = (row) => ({
+  calls: row?.calls || 0,
+  minutes: round2((row?.seconds || 0) / 60),
+  answered: row?.completed || 0
+});
+
+// Platform-wide revenue, sign-ups and calls for the admin charts. A date filter is always
+// applied here, "this year" when none was chosen.
+const getAdminTrends = async (query) => {
+  const period = buildPeriod(query.dateRange, query.startDate, query.endDate) || buildPeriod('this_year');
+  const current = between(period.start, new Date(Math.min(period.end.getTime(), Date.now())));
+  const prev = between(period.prevStart, period.prevEnd);
+  const paid = { payment_status: 'success', deleted_at: null };
+  const paymentGroup = (bucket) => ({
+    $group: {
+      _id: bucket ? bucketKey('$created_at', bucket) : null,
+      revenue: { $sum: '$amount' },
+      payments: { $sum: 1 }
+    }
+  });
+
+  const [payments, signups, calls, prevPayments, prevSignups, prevCalls, planRevenue, activeSubscriptions] = await Promise.all([
+    PaymentHistory.aggregate([{ $match: { ...paid, created_at: current } }, paymentGroup(period.bucket)]),
+    User.aggregate([
+      { $match: { created_at: current } },
+      { $group: { _id: bucketKey('$created_at', period.bucket), users: { $sum: 1 } } }
+    ]),
+    Call.aggregate([{ $match: { created_at: current } }, callGroup(period.bucket)]),
+    PaymentHistory.aggregate([{ $match: { ...paid, created_at: prev } }, paymentGroup(null)]),
+    User.countDocuments({ created_at: prev }),
+    Call.aggregate([{ $match: { created_at: prev } }, callGroup(null)]),
+    PaymentHistory.aggregate([
+      { $match: { ...paid, created_at: current } },
+      { $group: { _id: '$plan_id', revenue: { $sum: '$amount' }, payments: { $sum: 1 } } },
+      { $sort: { revenue: -1 } }
+    ]),
+    Subscription.find({ status: 'active', deleted_at: null })
+      .select('plan_id')
+      .populate('plan_id', 'amount billing_cycle plan_type')
+      .lean()
+  ]);
+
+  const paymentRows = byKey(payments);
+  const signupRows = byKey(signups);
+  const callRows = byKey(calls);
+  const trend = listBuckets(period).map(({ key, label }) => {
+    const pay = paymentRows.get(key);
+    const call = callRows.get(key);
+    return {
+      label,
+      revenue: round2(pay?.revenue),
+      payments: pay?.payments || 0,
+      signups: signupRows.get(key)?.users || 0,
+      inbound: call?.inbound || 0,
+      outbound: call?.outbound || 0,
+      answered: call?.completed || 0,
+      minutes: round2((call?.seconds || 0) / 60)
+    };
+  });
+
+  const plans = await Plan.find({ _id: { $in: planRevenue.map((row) => row._id).filter(Boolean) } })
+    .select('name')
+    .lean();
+  const planNames = new Map(plans.map((plan) => [String(plan._id), plan.name]));
+  const revenueByPlan = planRevenue
+    .filter((row) => row.revenue > 0)
+    .map((row) => ({
+      name: planNames.get(String(row._id)) || 'Other',
+      revenue: round2(row.revenue),
+      payments: row.payments
+    }));
+
+  // Monthly recurring revenue: active subscriptions on repeating plans, yearly plans spread over 12 months.
+  let mrr = 0;
+  let recurringSubscribers = 0;
+  for (const sub of activeSubscriptions) {
+    const plan = sub.plan_id;
+    if (!plan || plan.plan_type === 'top_up' || !(plan.amount > 0)) continue;
+    if (plan.billing_cycle === 'monthly') mrr += plan.amount;
+    else if (plan.billing_cycle === 'yearly') mrr += plan.amount / 12;
+    else continue;
+    recurringSubscribers += 1;
   }
 
-  const now = new Date();
-  let start;
-  let end;
-
-  switch (dateRange) {
-    case 'today': {
-      start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
-      end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
-      break;
+  const sum = (key) => trend.reduce((total, row) => total + row[key], 0);
+  const currentCalls = sum('inbound') + sum('outbound');
+  return {
+    bucket: period.bucket,
+    compareLabel: period.compareLabel,
+    trend,
+    revenueByPlan,
+    summary: {
+      revenue: { current: round2(sum('revenue')), previous: round2(prevPayments[0]?.revenue) },
+      payments: { current: sum('payments'), previous: prevPayments[0]?.payments || 0 },
+      signups: { current: sum('signups'), previous: prevSignups },
+      calls: { current: currentCalls, previous: prevCalls[0]?.calls || 0 },
+      minutes: { current: round2(sum('minutes')), previous: callTotals(prevCalls[0]).minutes },
+      answered: { current: sum('answered'), previous: callTotals(prevCalls[0]).answered },
+      mrr: round2(mrr),
+      recurringSubscribers
     }
-    case 'this_week': {
-      const day = now.getDay();
-      const diffToMonday = (day + 6) % 7;
-      start = new Date(now);
-      start.setDate(now.getDate() - diffToMonday);
-      start.setHours(0, 0, 0, 0);
-      end = new Date(start);
-      end.setDate(start.getDate() + 6);
-      end.setHours(23, 59, 59, 999);
-      break;
-    }
-    case 'this_month': {
-      start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
-      end = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
-      break;
-    }
-    case 'this_year': {
-      start = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0);
-      end = new Date(now.getFullYear(), 11, 31, 23, 59, 59, 999);
-      break;
-    }
-    case 'custom': {
-      if (!startDate || !endDate) {
-        return null;
-      }
+  };
+};
 
-      start = new Date(startDate);
-      end = new Date(endDate);
+// One client's calls and campaigns for the user dashboard charts.
+const getUserTrends = async (userId, query) => {
+  const period = buildPeriod(query.dateRange, query.startDate, query.endDate) || buildPeriod('this_year');
+  const current = between(period.start, new Date(Math.min(period.end.getTime(), Date.now())));
+  const prev = between(period.prevStart, period.prevEnd);
+  const campaignGroup = { $group: { _id: bucketKey('$created_at', period.bucket), count: { $sum: 1 } } };
 
-      if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-        return null;
-      }
+  const [calls, prevCalls, campaigns, smsCampaigns, appointments, prevAppointments] = await Promise.all([
+    Call.aggregate([{ $match: { user_id: userId, created_at: current } }, callGroup(period.bucket)]),
+    Call.aggregate([{ $match: { user_id: userId, created_at: prev } }, callGroup(null)]),
+    Campaign.aggregate([{ $match: { userId: userId, created_at: current } }, campaignGroup]),
+    SMSCampaign.aggregate([{ $match: { user_id: userId, created_at: current } }, campaignGroup]),
+    Appointment.countDocuments({ user_id: userId, created_at: current }),
+    Appointment.countDocuments({ user_id: userId, created_at: prev })
+  ]);
 
-      start.setHours(0, 0, 0, 0);
-      end.setHours(23, 59, 59, 999);
-      break;
+  const callRows = byKey(calls);
+  const campaignRows = byKey(campaigns);
+  const smsRows = byKey(smsCampaigns);
+  const trend = listBuckets(period).map(({ key, label }) => {
+    const call = callRows.get(key);
+    return {
+      label,
+      inbound: call?.inbound || 0,
+      outbound: call?.outbound || 0,
+      answered: call?.completed || 0,
+      minutes: round2((call?.seconds || 0) / 60),
+      aiCampaigns: campaignRows.get(key)?.count || 0,
+      smsCampaigns: smsRows.get(key)?.count || 0
+    };
+  });
+
+  const sum = (key) => trend.reduce((total, row) => total + row[key], 0);
+  const previous = callTotals(prevCalls[0]);
+  return {
+    bucket: period.bucket,
+    compareLabel: period.compareLabel,
+    trend,
+    summary: {
+      calls: { current: sum('inbound') + sum('outbound'), previous: previous.calls },
+      minutes: { current: round2(sum('minutes')), previous: previous.minutes },
+      answered: { current: sum('answered'), previous: previous.answered },
+      appointments: { current: appointments, previous: prevAppointments }
     }
-    default:
-      return null;
-  }
-
-  return { start, end };
+  };
 };
 
 exports.getAdminDashboardData = async (req, res) => {
@@ -286,6 +404,8 @@ exports.getAdminDashboardData = async (req, res) => {
       .limit(5)
       .lean();
 
+    const trends = await getAdminTrends(req.query);
+
 
     res.json({
       success: true,
@@ -317,7 +437,8 @@ exports.getAdminDashboardData = async (req, res) => {
           systemFlow,
           recentSmsCampaignsOfCurrentUser,
           recentContactOfCurrentUser
-        }
+        },
+        trends
       }
     });
   } catch (error) {
@@ -568,6 +689,7 @@ exports.getUserDashboardData = async (req, res) => {
     const recentActivity = recentActivitiesArray.slice(0, 5);
 
     const creditStats = await creditService.getCreditStatistics(userId);
+    const trends = await getUserTrends(userId, req.query);
 
     res.json({
       success: true,
@@ -598,7 +720,8 @@ exports.getUserDashboardData = async (req, res) => {
           recentTeamMembers,
           recentActivity
         },
-        credits: creditStats
+        credits: creditStats,
+        trends
       }
     });
   } catch (error) {

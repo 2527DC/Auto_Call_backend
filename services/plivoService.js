@@ -2,6 +2,15 @@
 
 const plivo = require('plivo');
 
+// Hard stop for a call whose agent sets no max_call_duration. Plivo's own default
+// is 4 hours, which a stuck AI call would run up in full.
+const DEFAULT_CALL_TIME_LIMIT_S = 3600;
+
+// Seconds after pickup at which Plivo ends the call: the agent's max_call_duration
+// plus a minute for its goodbye (Voxeno ends the call itself before that).
+const callTimeLimit = (agent) =>
+  agent?.max_call_duration > 0 ? agent.max_call_duration + 60 : DEFAULT_CALL_TIME_LIMIT_S;
+
 class PlivoService {
   async getNumbers(authId, authToken) {
     try {
@@ -23,13 +32,14 @@ class PlivoService {
     }
   }
 
-  async makeCall(authId, authToken, from, to, url, statusCallbackUrl = null) {
+  async makeCall(authId, authToken, from, to, url, statusCallbackUrl = null, { agent = null } = {}) {
     try {
       const client = new plivo.Client(authId, authToken);
       
       const callOptions = {
         answerUrl: url,
         answerMethod: 'POST',
+        timeLimit: callTimeLimit(agent),
       };
 
       if (statusCallbackUrl) {

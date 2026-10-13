@@ -40,6 +40,31 @@ const HELLO_END_SILENCE_MS = 350;  // pause that ends their hello
 const HELLO_MAX_EXTRA_MS = 2500;   // greet anyway if they keep talking past the wait
 const DEFAULT_HELLO_WAIT_MS = 1000;
 
+// Caller audio sent to speech-to-text, which bills every second of it: a little
+// lead-in so soft first syllables are kept, and only a short tail of the
+// silence that ended the turn.
+const PRE_ROLL_MS = 250;
+const TRAILING_SILENCE_KEPT_MS = 200;
+
+// Messages of the conversation sent to the AI each turn (the greeting and the
+// last 9 or so exchanges); every one is paid for again on every turn.
+const HISTORY_TURNS_SENT = 20;
+
+// A caller who goes quiet is asked if they are still there, and the call ends
+// (with the agent's goodbye) once the silence reaches the agent's idle_timeout.
+// Without this a silent line stays open, and billed, for hours.
+const IDLE_CHECK_EVERY_MS = 2000;
+const IDLE_CHECK_IN_MAX_MS = 20000;
+const DEFAULT_IDLE_TIMEOUT_S = 60;
+// Hang up anyway if the goodbye never reports that it finished playing.
+const GOODBYE_HANGUP_FALLBACK_MS = 15000;
+const STILL_THERE = {
+  hi: 'क्या आप अभी भी लाइन पर हैं?',
+  kn: 'ನೀವು ಇನ್ನೂ ಲೈನ್‌ನಲ್ಲಿ ಇದ್ದೀರಾ?',
+  en: 'Are you still there?',
+};
+const DEFAULT_GOODBYE = 'Goodbye! Thank you for calling.';
+
 class VoiceAutomationService extends EventEmitter {
   constructor() {
     super();
@@ -152,7 +177,10 @@ class VoiceAutomationService extends EventEmitter {
     this.io = io;
   }
 
-  async handleStreamCallCompletion(callSid, userId) {
+  // answeredAt: when the call's audio stream started, i.e. when it was picked
+  // up. The call log's started_at is set when the call is placed, so billing
+  // from it would charge for the ringing.
+  async handleStreamCallCompletion(callSid, userId, answeredAt = null) {
     try {
       if (!callSid) return;
       const call = await Call.findOne({ twilio_call_sid: callSid });
@@ -164,8 +192,9 @@ class VoiceAutomationService extends EventEmitter {
       const now = new Date();
       call.status = 'completed';
       call.ended_at = now;
-      if (call.started_at) {
-        call.duration = Math.max(1, Math.round((now.getTime() - new Date(call.started_at).getTime()) / 1000));
+      if (answeredAt || call.started_at) {
+        const from = answeredAt || new Date(call.started_at).getTime();
+        call.duration = Math.max(1, Math.round((now.getTime() - from) / 1000));
       } else {
         call.started_at = now;
         call.duration = 1;
@@ -211,13 +240,15 @@ class VoiceAutomationService extends EventEmitter {
   endStream(streamSid) {
     const closingStream = this.activeStreams.get(streamSid);
     if (!closingStream) return;
+    clearInterval(closingStream.idleTimer);
+    clearTimeout(closingStream.maxDurationTimer);
     this.finishHello(closingStream, 'ended');
     if (closingStream.callSid) {
       if (closingStream.usage) {
         Call.updateOne({ twilio_call_sid: closingStream.callSid }, { $set: { usage: closingStream.usage } })
           .catch((e) => console.error('[Usage] Could not save call usage:', e.message));
       }
-      this.handleStreamCallCompletion(closingStream.callSid, closingStream.userId);
+      this.handleStreamCallCompletion(closingStream.callSid, closingStream.userId, closingStream.callStartTime);
       this.handlePostCallIntegrations(closingStream.callSid, closingStream.userId);
       this.plivoCallIds.delete(closingStream.callSid);
     }
@@ -225,9 +256,9 @@ class VoiceAutomationService extends EventEmitter {
     console.log(`Stream stopped: ${streamSid}`);
   }
 
-  // True while the agent is thinking or talking; caller audio is dropped then.
+  // True while the agent is thinking or talking, or saying goodbye; caller audio is dropped then.
   isAgentTurn(stream) {
-    return stream.processingTurn || stream.pendingPlaybacks > 0 || Date.now() < (stream.listenAfter || 0);
+    return stream.ending || stream.processingTurn || stream.pendingPlaybacks > 0 || Date.now() < (stream.listenAfter || 0);
   }
 
   greetingText(agent) {
@@ -363,7 +394,7 @@ class VoiceAutomationService extends EventEmitter {
     return this.encodePcmToUlaw(pcmBuffer, 16000).toString('base64');
   }
 
-  // Makes audio ahead of time and keeps it (memory + Redis); does nothing if it
+  // Makes audio ahead of time and keeps it (memory + disk); does nothing if it
   // is already kept or already being made.
   warmSpeech({ agent, text, voiceId, settings }) {
     const { activeProvider, activeVoiceId } = this.pickVoice(agent, voiceId);
@@ -435,6 +466,9 @@ class VoiceAutomationService extends EventEmitter {
         streamForMark.isSpeaking = false;
         streamForMark.silenceMs = 0;
         streamForMark.speechMs = 0;
+        // Silence is counted from the end of the agent's reply, but not from
+        // its own "are you still there?", so the call still ends on time.
+        if (!streamForMark.idleCheckedIn) streamForMark.quietSince = Date.now();
         console.log(`[Turn] Agent finished speaking, listening to caller (${streamSid})`);
       }
     }
@@ -452,17 +486,90 @@ class VoiceAutomationService extends EventEmitter {
           console.error('Error transferring call after mark:', err.message);
         }
       }
-    } else if (streamForMark && streamForMark.pendingTerminate) {
+    } else if (streamForMark && streamForMark.pendingTerminate && !streamForMark.pendingPlaybacks) {
+      // Only once everything queued (the goodbye last) has played.
       console.log(`[Flow] Speech completed, terminating call gracefully.`);
-      const client = await this.getCallControlClient(streamForMark.userId);
-      if (client && streamForMark.callSid) {
-        try {
-          await client.calls(streamForMark.callSid).update({ status: 'completed' });
-          streamForMark.pendingTerminate = false;
-        } catch (err) {
-          console.error('Error terminating call after mark:', err.message);
-        }
-      }
+      streamForMark.pendingTerminate = false;
+      await this.hangUp(streamForMark, 'after goodbye');
+    }
+  }
+
+  async hangUp(stream, reason) {
+    if (!stream?.callSid || stream.hungUp) return;
+    stream.hungUp = true;
+    const client = await this.getCallControlClient(stream.userId);
+    if (!client) return;
+    try {
+      await client.calls(stream.callSid).update({ status: 'completed' });
+      console.log(`[Call] Hung up ${stream.callSid} (${reason})`);
+    } catch (err) {
+      stream.hungUp = false;
+      console.error(`Error hanging up call (${reason}):`, err.message);
+    }
+  }
+
+  // Says goodbye and hangs up once it has played, instead of cutting it off.
+  // Only the first call to end a call counts.
+  async endCallWithGoodbye(streamSid, ws, reason, text = null) {
+    const stream = this.activeStreams.get(streamSid);
+    if (!stream || stream.ending) return;
+    stream.ending = true;
+    clearInterval(stream.idleTimer);
+    clearTimeout(stream.maxDurationTimer);
+    const agent = stream.agent;
+    console.log(`[Call] Ending call ${stream.callSid}: ${reason}`);
+    stream.pendingTerminate = true;
+    setTimeout(() => {
+      if (this.activeStreams.has(streamSid)) this.hangUp(stream, `${reason}, goodbye did not finish`);
+    }, GOODBYE_HANGUP_FALLBACK_MS).unref?.();
+    await this.speak(ws, streamSid, text || agent?.goodbye_message || DEFAULT_GOODBYE, agent?.voice_id || null, stream.userSettings?.elevenlabs_api_key);
+    // Nothing was queued to play (e.g. no voice key): hang up now.
+    if (stream.pendingTerminate && !stream.pendingPlaybacks) {
+      stream.pendingTerminate = false;
+      await this.hangUp(stream, reason);
+    }
+  }
+
+  // The agent's idle_timeout (seconds of silence before hanging up; 0 = off).
+  idleLimitMs(agent) {
+    const seconds = agent?.idle_timeout ?? DEFAULT_IDLE_TIMEOUT_S;
+    return seconds > 0 ? seconds * 1000 : 0;
+  }
+
+  // Runs every few seconds while the caller's turn is open: asks once whether
+  // they are still there, then ends a call that stays silent.
+  checkIdle(streamSid, ws) {
+    const stream = this.activeStreams.get(streamSid);
+    if (!stream || stream.ending || stream.pendingTransfer || !stream.hello?.done) return;
+    if (this.isAgentTurn(stream) || stream.isSpeaking) return;
+    const limitMs = this.idleLimitMs(stream.agent);
+    if (!limitMs) return;
+    const quietMs = Date.now() - (stream.quietSince || stream.callStartTime);
+    if (quietMs >= limitMs) {
+      this.endCallWithGoodbye(streamSid, ws, `caller silent for ${Math.round(quietMs / 1000)}s`)
+        .catch(err => console.error('[Call] Idle hang-up failed:', err.message));
+    } else if (!stream.idleCheckedIn && quietMs >= Math.min(IDLE_CHECK_IN_MAX_MS, limitMs / 2)) {
+      stream.idleCheckedIn = true;
+      const language = String(stream.agent?.language || 'en').split(/[-_]/)[0].toLowerCase();
+      this.speak(ws, streamSid, STILL_THERE[language] || STILL_THERE.en, stream.agent?.voice_id || null, stream.userSettings?.elevenlabs_api_key)
+        .catch(err => console.error('[Call] Idle check-in failed:', err.message));
+    }
+  }
+
+  // Starts the silence watch and the agent's max_call_duration timer, once the
+  // call's agent is known.
+  startCallTimers(streamSid, ws) {
+    const stream = this.activeStreams.get(streamSid);
+    if (!stream || stream.idleTimer) return;
+    stream.quietSince = Date.now();
+    stream.idleTimer = setInterval(() => this.checkIdle(streamSid, ws), IDLE_CHECK_EVERY_MS);
+    const maxSeconds = stream.agent?.max_call_duration;
+    if (maxSeconds > 0) {
+      const leftMs = Math.max(0, maxSeconds * 1000 - (Date.now() - stream.callStartTime));
+      stream.maxDurationTimer = setTimeout(() => {
+        this.endCallWithGoodbye(streamSid, ws, `max call duration ${maxSeconds}s reached`)
+          .catch(err => console.error('[Call] Max-duration hang-up failed:', err.message));
+      }, leftMs);
     }
   }
 
@@ -733,6 +840,7 @@ class VoiceAutomationService extends EventEmitter {
             if (startStream) {
               startStream.processingTurn = false;
               this.finishHello(startStream, 'no greeting');
+              this.startCallTimers(streamSid, ws);
             }
             console.log(`[Timing] Greeting sent ${Date.now() - startedAt}ms after stream start`);
           }
@@ -764,12 +872,13 @@ class VoiceAutomationService extends EventEmitter {
             const MIN_SPEECH_MS = 200;     // ignore clicks and short noise bursts
             const END_OF_TURN_SILENCE_MS = 700;   // Responsive turn-taking (cuts dead air by 600ms)
             const MAX_UTTERANCE_MS = 30000; // long interview answers
-            const PRE_ROLL_MS = 400;
 
             if (rms > SPEECH_THRESHOLD) {
               stream.isSpeaking = true;
               stream.silenceMs = 0;
               stream.speechMs = (stream.speechMs || 0) + chunkMs;
+              stream.quietSince = Date.now();
+              stream.idleCheckedIn = false;
             } else if (stream.isSpeaking) {
               stream.silenceMs = (stream.silenceMs || 0) + chunkMs;
             }
@@ -788,7 +897,10 @@ class VoiceAutomationService extends EventEmitter {
             const endOfTurn = stream.silenceMs >= END_OF_TURN_SILENCE_MS || utteranceMs >= MAX_UTTERANCE_MS;
             if (!endOfTurn) break;
 
-            const fullBuffer = Buffer.concat(stream.audioBuffer);
+            // Most of the silence that ended the turn is dropped before speech-to-text.
+            const joined = Buffer.concat(stream.audioBuffer);
+            const trailingDropMs = Math.max(0, stream.silenceMs - TRAILING_SILENCE_KEPT_MS);
+            const fullBuffer = joined.subarray(0, Math.max(0, joined.length - Math.floor(trailingDropMs * 8)));
             const wasRealSpeech = stream.speechMs >= MIN_SPEECH_MS;
             stream.audioBuffer = [];
             stream.isSpeaking = false;
@@ -838,8 +950,9 @@ class VoiceAutomationService extends EventEmitter {
   }
 
   async processCallerTurn(stream, streamSid, ws, audioBuffer) {
+    if (stream.ending) return;
     const text = await this.processSTT(audioBuffer, stream.userId, stream.agentId, stream.flowId);
-    if (!text || !text.trim()) return;
+    if (!text || !text.trim() || stream.ending) return;
 
     console.log(`Processing complete sentence: "${text}"`);
 
@@ -856,24 +969,8 @@ class VoiceAutomationService extends EventEmitter {
       if (currentAgentForChecks.max_call_duration && stream.callStartTime) {
         const elapsedSeconds = Math.floor((Date.now() - stream.callStartTime) / 1000);
         if (elapsedSeconds >= currentAgentForChecks.max_call_duration) {
-          console.log(`Max call duration reached (${currentAgentForChecks.max_call_duration}s). Terminating call.`);
-
-          let goodbyeMessage = "Thank you for your time. Goodbye!";
-          if (currentAgentForChecks.goodbye_message) {
-            goodbyeMessage = currentAgentForChecks.goodbye_message;
-          }
-
-          earlyUserSettings = await UserSettings.findOne({ user: stream.userId });
-          await this.speak(ws, streamSid, goodbyeMessage, currentAgentForChecks.voice_id || null, earlyUserSettings?.elevenlabs_api_key);
-
-          const client = await this.getCallControlClient(stream.userId);
-          if (client && stream.callSid) {
-            try {
-              await client.calls(stream.callSid).update({ status: 'completed' });
-            } catch (err) {
-              console.error('Error terminating call due to max duration:', err.message);
-            }
-          }
+          await this.endCallWithGoodbye(streamSid, ws, `max call duration ${currentAgentForChecks.max_call_duration}s reached`,
+            currentAgentForChecks.goodbye_message || 'Thank you for your time. Goodbye!');
           return;
         }
       }
@@ -948,26 +1045,7 @@ class VoiceAutomationService extends EventEmitter {
     }
 
     if (isHangup) {
-      console.log('Hangup cue detected. Ending call via Twilio API.');
-
-      let goodbyeMessage = "Goodbye! Thank you for calling.";
-      if (currentAgentForChecks?.goodbye_message) {
-        goodbyeMessage = currentAgentForChecks.goodbye_message;
-      }
-
-      if (!earlyUserSettings) {
-        earlyUserSettings = await UserSettings.findOne({ user: stream.userId });
-      }
-      await this.speak(ws, streamSid, goodbyeMessage, currentAgentForChecks?.voice_id || null, earlyUserSettings?.elevenlabs_api_key);
-
-      const client = await this.getCallControlClient(stream.userId);
-      if (client && stream.callSid) {
-        try {
-          await client.calls(stream.callSid).update({ status: 'completed' });
-        } catch (err) {
-          console.error('Error hanging up call:', err.message);
-        }
-      }
+      await this.endCallWithGoodbye(streamSid, ws, 'caller said goodbye', currentAgentForChecks?.goodbye_message);
       return;
     }
 
@@ -1151,11 +1229,14 @@ class VoiceAutomationService extends EventEmitter {
           if (!stream.conversationHistory) stream.conversationHistory = [];
           stream.conversationHistory.push({ role: 'user', text });
 
+          // The whole history is sent every turn, so long calls keep only the
+          // latest turns. The caller's last words are its final line.
           const conversationContext = stream.conversationHistory
+            .slice(-HISTORY_TURNS_SENT)
             .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`)
             .join('\n');
 
-          const fullPrompt = `Conversation so far:\n${conversationContext}\n\nUser: ${text}`;
+          const fullPrompt = `Conversation so far:\n${conversationContext}\n\nReply to the user's last message.`;
 
           let systemPrompt = currentAgent.system_prompt || currentAgent.personality || '';
           if (currentAgent.custom_knowledge_base) {

@@ -296,7 +296,8 @@ if (process.env.REDIS_URL) {
                 fromNumber,
                 to,
                 xmlUrl,
-                statusCallbackUrl
+                statusCallbackUrl,
+                { agent }
               );
 
               await Call.create({

@@ -100,7 +100,10 @@ class ElevenLabsService {
     return Buffer.concat([header, pcmBuffer]);
   }
 
+  // Copies of call audio for debugging, only when SAVE_DEBUG_AUDIO=true: written
+  // for every utterance, they slowed replies and filled the disk.
   async saveAudio(buffer, filename) {
+    if (process.env.SAVE_DEBUG_AUDIO !== 'true') return;
     try {
       const uploadDir = path.join(process.cwd(), 'uploads', 'debug_audio');
       await fs.ensureDir(uploadDir);

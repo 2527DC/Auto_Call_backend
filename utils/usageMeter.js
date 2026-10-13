@@ -30,12 +30,13 @@ const recordUsage = (fields) => {
 };
 
 // OpenAI, Anthropic and Gemini each report token counts in their own shape.
+// Gemini bills its thinking as output but reports it separately.
 const recordLlmResponse = (data) => {
   const u = data?.usage;
   const g = data?.usageMetadata;
   recordUsage({
     llm_input_tokens: u?.prompt_tokens ?? u?.input_tokens ?? g?.promptTokenCount ?? 0,
-    llm_output_tokens: u?.completion_tokens ?? u?.output_tokens ?? g?.candidatesTokenCount ?? 0,
+    llm_output_tokens: u?.completion_tokens ?? u?.output_tokens ?? ((g?.candidatesTokenCount ?? 0) + (g?.thoughtsTokenCount ?? 0)),
   });
 };
 

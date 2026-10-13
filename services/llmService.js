@@ -8,6 +8,32 @@ axios.interceptors.response.use((response) => {
   return response;
 });
 
+// How long a spoken reply may be. Every word is paid for twice (AI output, then
+// voice), so replies are short unless the agent is set to 'verbose'. maxTokens
+// leaves room for Hindi and Kannada, which take more tokens per word.
+const REPLY_LENGTH = {
+  concise: { rule: 'Reply in one short sentence, two at most (under 25 words).', maxTokens: 150 },
+  balanced: { rule: 'Reply in one or two short sentences (under 40 words).', maxTokens: 200 },
+  verbose: { rule: 'Reply in up to four sentences when the caller needs detail.', maxTokens: 400 },
+};
+const PHONE_RULES = 'This is a phone call: speak naturally, as a person would. No lists, markdown or emojis.';
+// Retired models (gemini-1.5-flash) no longer answer, so a rate-limited live call retries on this.
+const GEMINI_FALLBACK_MODEL = 'gemini-2.5-flash-lite';
+
+// Gemini 2.5 Flash thinks before answering unless told not to, and thinking is
+// billed as output. A phone reply doesn't need it. Gemini 3 models reject this
+// setting, so it is only sent to 2.5 Flash models.
+const withoutThinking = (model, generationConfig) =>
+  /^(models\/)?gemini-2\.5-flash/i.test(model)
+    ? { ...generationConfig, thinkingConfig: { thinkingBudget: 0 } }
+    : generationConfig;
+
+// A reply cut off by the token limit ends at its last full sentence instead of mid-word.
+const endAtSentence = (text) => {
+  const match = String(text).match(/^[\s\S]*[.!?।॥](?=\s|$)/);
+  return match && match[0].length >= text.length * 0.3 ? match[0] : text;
+};
+
 class LLMService {
   async generateResponse(prompt, personality, model = 'gemini-2.5-flash', aiConfig = null) {
     try {
@@ -83,10 +109,6 @@ class LLMService {
           traits.push(`Energy Level: ${agentConfig.energy_level === 'energetic' ? 'Be enthusiastic and energetic' : agentConfig.energy_level === 'calm' ? 'Maintain a calm and soothing tone' : 'Keep a balanced, professional tone'}`);
         }
 
-        if (agentConfig.response_length) {
-          traits.push(`Response Length: ${agentConfig.response_length === 'concise' ? 'Keep responses very brief (1-2 sentences)' : agentConfig.response_length === 'verbose' ? 'Provide detailed explanations' : 'Keep responses moderate in length'}`);
-        }
-
         if (agentConfig.intelligence_level !== undefined) {
           const intelLevel = agentConfig.intelligence_level;
           traits.push(`Intelligence Level: ${intelLevel}/10 - ${intelLevel >= 8 ? 'Provide sophisticated, nuanced responses' : intelLevel >= 5 ? 'Provide clear, straightforward responses' : 'Keep responses simple and basic'}`);
@@ -97,13 +119,16 @@ class LLMService {
         }
       }
 
+      const length = REPLY_LENGTH[agentConfig?.response_length] || REPLY_LENGTH.balanced;
+      enhancedSystemPrompt += `\n\nREPLY RULES:\n${length.rule} ${PHONE_RULES}`;
+
       switch (provider) {
         case 'gemini':
-          return await this.callGeminiWithSystem(cleanPrompt, enhancedSystemPrompt, resolvedModel, apiKey);
+          return await this.callGeminiWithSystem(cleanPrompt, enhancedSystemPrompt, resolvedModel, apiKey, length.maxTokens);
         case 'openai':
-          return await this.callOpenAIWithSystem(cleanPrompt, enhancedSystemPrompt, resolvedModel, apiKey);
+          return await this.callOpenAIWithSystem(cleanPrompt, enhancedSystemPrompt, resolvedModel, apiKey, length.maxTokens);
         case 'anthropic':
-          return await this.callAnthropicWithSystem(cleanPrompt, enhancedSystemPrompt, resolvedModel, apiKey);
+          return await this.callAnthropicWithSystem(cleanPrompt, enhancedSystemPrompt, resolvedModel, apiKey, length.maxTokens);
         default:
           return "I'm sorry, the selected AI provider is not supported.";
       }
@@ -190,68 +215,64 @@ class LLMService {
     return response.data.content[0].text;
   }
 
-  async callGeminiWithSystem(prompt, systemPrompt, model, apiKey) {
+  // systemPrompt already carries the reply-length rules (generateResponseWithSystemPrompt).
+  async callGeminiWithSystem(prompt, systemPrompt, model, apiKey, maxTokens = REPLY_LENGTH.balanced.maxTokens) {
     const modelId = model.startsWith('models/') ? model : `models/${model}`;
     const url = `https://generativelanguage.googleapis.com/v1beta/${modelId}:generateContent?key=${apiKey}`;
-    const payload = {
+    const payload = (forModel) => ({
       contents: [{ parts: [{ text: prompt }] }],
-      system_instruction: {
-        parts: [{
-          text: `${systemPrompt}
-
-CRITICAL INSTRUCTIONS:
-1. Keep responses SHORT and CONCISE. Maximum 2-3 sentences. This is a phone call.
-2. Speak naturally as if talking on the phone.
-3. Be helpful, professional, and follow the system prompt above strictly.`
-        }]
-      },
-      generationConfig: { temperature: 0.7, maxOutputTokens: 512 }
-    };
+      system_instruction: { parts: [{ text: systemPrompt }] },
+      generationConfig: withoutThinking(forModel, { temperature: 0.7, maxOutputTokens: maxTokens })
+    });
     let response;
     try {
-      response = await axios.post(url, payload);
+      response = await axios.post(url, payload(model));
     } catch (err) {
       if (err.response && err.response.status === 429) {
         await new Promise(resolve => setTimeout(resolve, 2000));
-        const fallbackUrl = url.replace(model, 'gemini-1.5-flash');
-        response = await axios.post(fallbackUrl, payload);
+        const fallbackUrl = url.replace(model, GEMINI_FALLBACK_MODEL);
+        response = await axios.post(fallbackUrl, payload(GEMINI_FALLBACK_MODEL));
       } else throw err;
     }
-    if (response.data.candidates && response.data.candidates[0].content) {
-      return response.data.candidates[0].content.parts[0].text;
+    const candidate = response.data.candidates?.[0];
+    if (candidate?.content) {
+      const text = candidate.content.parts[0].text;
+      return candidate.finishReason === 'MAX_TOKENS' ? endAtSentence(text) : text;
     }
     throw new Error('No response from Gemini');
   }
 
-  async callOpenAIWithSystem(prompt, systemPrompt, model, apiKey) {
+  async callOpenAIWithSystem(prompt, systemPrompt, model, apiKey, maxTokens = REPLY_LENGTH.balanced.maxTokens) {
     const response = await axios.post(
       'https://api.openai.com/v1/chat/completions',
       {
         model: model || 'gpt-4o-mini',
         messages: [
-          { role: 'system', content: `${systemPrompt}\n\nKeep responses very short (2-3 sentences max). This is a phone call.` },
+          { role: 'system', content: systemPrompt },
           { role: 'user', content: prompt }
         ],
         temperature: 0.7,
-        max_tokens: 200
+        max_tokens: maxTokens
       },
       { headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' } }
     );
-    return response.data.choices[0].message.content;
+    const choice = response.data.choices[0];
+    return choice.finish_reason === 'length' ? endAtSentence(choice.message.content) : choice.message.content;
   }
 
-  async callAnthropicWithSystem(prompt, systemPrompt, model, apiKey) {
+  async callAnthropicWithSystem(prompt, systemPrompt, model, apiKey, maxTokens = REPLY_LENGTH.balanced.maxTokens) {
     const response = await axios.post(
       'https://api.anthropic.com/v1/messages',
       {
         model: model || 'claude-3-haiku-20240307',
-        max_tokens: 200,
-        system: `${systemPrompt}\n\nKeep responses very short (2-3 sentences max). This is a phone call.`,
+        max_tokens: maxTokens,
+        system: systemPrompt,
         messages: [{ role: 'user', content: prompt }]
       },
       { headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' } }
     );
-    return response.data.content[0].text;
+    const text = response.data.content[0].text;
+    return response.data.stop_reason === 'max_tokens' ? endAtSentence(text) : text;
   }
 
   async callGemini(prompt, personality, model, apiKey) {
@@ -270,12 +291,12 @@ CRITICAL INSTRUCTIONS:
 2. LANGUAGE: You MUST speak ONLY in English. If the user speaks another language, reply politely in English that you only support English for now.
 3. TONE: Professional and helpful.` }]
       },
-      generationConfig: {
+      generationConfig: withoutThinking(model, {
         temperature: 0.7,
         topK: 40,
         topP: 0.95,
         maxOutputTokens: 1024,
-      }
+      })
     };
 
     let response;

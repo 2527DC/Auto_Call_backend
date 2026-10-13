@@ -100,7 +100,8 @@ const placeCall = async ({ userId, isAdmin = false, flowId, agentId, phoneNumber
       fromNumber,
       phoneNumber,
       xmlUrl,
-      statusCallbackUrl
+      statusCallbackUrl,
+      { agent }
     );
 
     callLog = await Call.create({

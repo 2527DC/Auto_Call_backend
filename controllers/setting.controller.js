@@ -356,7 +356,12 @@ exports.getPublicSettings = async (req, res) => {
       'kyc_allow_pdf_upload',
       'kyc_required',
       'kyc_max_files',
-      'kyc_form_fields'
+      'kyc_form_fields',
+      // Credit rules, so plans can show how many call minutes their credits buy.
+      'credit_deduction_type',
+      'credits_per_minute',
+      'credits_per_call',
+      'credit_multiplier_elevenlabs'
     ];
 
     const settings = await Setting.findOne()

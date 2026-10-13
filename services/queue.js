@@ -78,6 +78,9 @@ if (process.env.REDIS_URL) {
       const flowId = agent ? agent.flow_id : null;
       const Contact = db.Contact;
       const appUrl = process.env.APP_URL || 'http://localhost:3000';
+      // Every call in a campaign opens with the same greeting: make its audio
+      // once now so it plays the moment each call is answered.
+      require('./voiceAutomationService').prepareGreeting({ agent, flowId, userId: campaign.userId });
 
       const rawContacts = [];
 
@@ -200,7 +203,7 @@ if (process.env.REDIS_URL) {
             continue;
           }
 
-          const twimlUrl = `${appUrl}/api/calls/twiml?flowId=${flowId}&userId=${campaign.userId}&agentId=${campaign.agentId}`;
+          const twimlUrl = `${appUrl}/api/calls/twiml?flowId=${flowId}&userId=${campaign.userId}&agentId=${campaign.agentId}&dir=out`;
 
           try {
             if (agent.telephony_provider === 'meta_whatsapp' || phoneNumberDoc.type === 'whatsapp') {
@@ -284,7 +287,7 @@ if (process.env.REDIS_URL) {
               if (!plivoAuthId || !plivoAuthToken) {
                 throw new Error('Plivo credentials not found for this user');
               }
-              const xmlUrl = `${appUrl}/api/calls/plivo-xml?flowId=${flowId}&userId=${campaign.userId}&agentId=${campaign.agentId}`;
+              const xmlUrl = `${appUrl}/api/calls/plivo-xml?flowId=${flowId}&userId=${campaign.userId}&agentId=${campaign.agentId}&dir=out&rec=${agent?.enable_call_recording ? 1 : 0}`;
               const statusCallbackUrl = `${appUrl}/api/calls/plivo-status`;
 
               const plivoCall = await plivoService.makeCall(

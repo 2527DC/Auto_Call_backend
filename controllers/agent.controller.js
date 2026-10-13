@@ -8,6 +8,10 @@ const Voice = db.Voice;
 const { checkFeatureLimit } = require('../utils/limitHelper');
 const elevenlabsService = require('../services/elevenlabsService');
 
+// Makes the agent's greeting audio as soon as it is saved, so even the first
+// call plays it instantly. Loaded on first use: the voice service pulls in much of the app.
+const prepareGreeting = (args) => require('../services/voiceAutomationService').prepareGreeting(args);
+
 exports.getAgents = async (req, res) => {
   try {
     const userId = req.user.id;
@@ -224,6 +228,7 @@ exports.createAgent = async (req, res) => {
     }
 
     const agent = await Agent.create(agentData);
+    prepareGreeting({ agent, flowId: agent.flow_id, userId });
     const populated = await agent.populate('llm_model', 'name display_name model_id provider status');
     res.status(201).json({ success: true, message: 'Agent created successfully', data: populated });
 
@@ -390,6 +395,7 @@ exports.updateAgent = async (req, res) => {
     if (!agent) {
       return res.status(404).json({ success: false, message: 'Agent not found' });
     }
+    prepareGreeting({ agent, flowId: agent.flow_id, userId });
 
     res.json({ success: true, message: 'Agent updated successfully', data: agent });
   } catch (error) {

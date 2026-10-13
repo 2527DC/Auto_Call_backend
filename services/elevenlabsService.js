@@ -5,10 +5,16 @@ const FormData = require('form-data');
 
 class ElevenLabsService {
   constructor() {
+    // eleven_v4_turbo answers in about 100 ms and speaks 90+ languages, including
+    // Hindi and Kannada (eleven_turbo_v2 is deprecated and English-only).
+    // ELEVENLABS_TTS_MODEL overrides it, e.g. eleven_flash_v2_5.
+    this.ttsModel = process.env.ELEVENLABS_TTS_MODEL || 'eleven_v4_turbo';
     this.apiKey = process.env.ELEVENLABS_API_KEY;
     this.baseUrl = 'https://api.elevenlabs.io/v1';
   }
 
+  // voiceSettings.language: the agent's language ("kn", "hi-IN", …). It is sent
+  // as ISO 639-1 so the model reads the text as that language.
   async generateSpeech(text, voiceId, voiceSettings = {}, apiKey = null) {
     const activeApiKey = apiKey || this.apiKey;
     if (!activeApiKey) {
@@ -17,12 +23,14 @@ class ElevenLabsService {
     try {
 
       const outputFormat = 'pcm_16000';
+      const languageCode = voiceSettings.language ? String(voiceSettings.language).split(/[-_]/)[0].toLowerCase() : null;
       const response = await axios({
         method: 'POST',
         url: `${this.baseUrl}/text-to-speech/${voiceId}?output_format=${outputFormat}`,
         data: {
           text,
-          model_id: 'eleven_turbo_v2',
+          model_id: this.ttsModel,
+          ...(languageCode ? { language_code: languageCode } : {}),
           voice_settings: {
             stability: voiceSettings.stability || 0.5,
             similarity_boost: voiceSettings.similarity_boost || 0.5,

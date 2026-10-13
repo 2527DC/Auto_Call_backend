@@ -26,7 +26,19 @@ const axios = require('axios');
 const whatsappService = require('./whatsappService');
 const emailService = require('./emailService');
 const llmService = require('./llmService');
+const ttsCache = require('./voice/ttsCache');
 const { decrypt } = require('../utils/encryption-utils');
+
+// Loudness (RMS of decoded mu-law) above which caller audio counts as speech.
+const SPEECH_RMS_THRESHOLD = 800;
+
+// Outgoing calls: people answer with "Hello?". Greeting at once talks over them
+// (and their words are dropped while the agent speaks), so by default the
+// greeting waits until they finish their hello, or plays after a silent wait.
+const HELLO_MIN_SPEECH_MS = 120;   // shorter bursts are clicks or line noise
+const HELLO_END_SILENCE_MS = 350;  // pause that ends their hello
+const HELLO_MAX_EXTRA_MS = 2500;   // greet anyway if they keep talking past the wait
+const DEFAULT_HELLO_WAIT_MS = 1000;
 
 class VoiceAutomationService extends EventEmitter {
   constructor() {
@@ -35,7 +47,9 @@ class VoiceAutomationService extends EventEmitter {
     this.twilioClient = null;
     // Call UUIDs of live Plivo streams, so call control goes to Plivo instead of Twilio.
     this.plivoCallIds = new Set();
-    this.ttsAudioCache = new Map();
+    // Greeting audio being made ahead of a call, by cache key, so a call that is
+    // answered meanwhile waits for it instead of making it a second time.
+    this.warming = new Map();
   }
 
   async getTwilioClient(userId) {
@@ -91,7 +105,7 @@ class VoiceAutomationService extends EventEmitter {
       const [key, ...rest] = pair.split('=');
       if (key && rest.length) {
         const name = key.trim().replace(/^X-PH-/i, '');
-        const canonical = { agentid: 'agentId', userid: 'userId', flowid: 'flowId' }[name.toLowerCase()] || name;
+        const canonical = { agentid: 'agentId', userid: 'userId', flowid: 'flowId', direction: 'direction' }[name.toLowerCase()] || name;
         acc[canonical] = rest.join('=').trim();
       }
       return acc;
@@ -197,6 +211,7 @@ class VoiceAutomationService extends EventEmitter {
   endStream(streamSid) {
     const closingStream = this.activeStreams.get(streamSid);
     if (!closingStream) return;
+    this.finishHello(closingStream, 'ended');
     if (closingStream.callSid) {
       if (closingStream.usage) {
         Call.updateOne({ twilio_call_sid: closingStream.callSid }, { $set: { usage: closingStream.usage } })
@@ -213,6 +228,198 @@ class VoiceAutomationService extends EventEmitter {
   // True while the agent is thinking or talking; caller audio is dropped then.
   isAgentTurn(stream) {
     return stream.processingTurn || stream.pendingPlaybacks > 0 || Date.now() < (stream.listenAfter || 0);
+  }
+
+  greetingText(agent) {
+    return agent.first_message || `Hello! I'm ${agent.name}. How can I help you today?`;
+  }
+
+  // How long an outgoing call waits for the customer's hello before greeting
+  // (0 = greet at once). Incoming and widget calls always greet at once.
+  greetingWaitFor(agent, direction) {
+    if (direction !== 'outbound' || !agent || agent.greeting_mode === 'immediate') return 0;
+    return agent.hello_wait_ms || DEFAULT_HELLO_WAIT_MS;
+  }
+
+  // Follows the caller's audio until the greeting starts, to tell when they
+  // have said hello and stopped.
+  trackHello(stream, payload) {
+    const hello = stream.hello;
+    const chunk = Buffer.from(payload, 'base64');
+    const chunkMs = chunk.length / 8;
+    if (this.calculateUlawRMS(chunk) > SPEECH_RMS_THRESHOLD) {
+      hello.speechMs += chunkMs;
+      hello.silenceMs = 0;
+    } else {
+      hello.silenceMs += chunkMs;
+      if (hello.speechMs < HELLO_MIN_SPEECH_MS && hello.silenceMs >= HELLO_END_SILENCE_MS) hello.speechMs = 0;
+    }
+    this.checkHello(stream);
+  }
+
+  checkHello(stream) {
+    const hello = stream.hello;
+    if (!hello || hello.done || hello.waitMs == null) return;
+    const elapsed = Date.now() - stream.callStartTime;
+    const midSpeech = hello.speechMs > 0 && hello.silenceMs < HELLO_END_SILENCE_MS;
+    if (hello.speechMs >= HELLO_MIN_SPEECH_MS && !midSpeech) this.finishHello(stream, 'hello');
+    else if (!midSpeech && elapsed >= hello.waitMs) this.finishHello(stream, 'silence');
+    else if (elapsed >= hello.waitMs + HELLO_MAX_EXTRA_MS) this.finishHello(stream, 'kept talking');
+  }
+
+  finishHello(stream, reason) {
+    const hello = stream?.hello;
+    if (!hello || hello.done) return;
+    hello.done = true;
+    hello.timers.forEach(clearTimeout);
+    if (hello.waitMs != null) {
+      console.log(`[Greeting] ${reason === 'hello' ? 'Customer said hello' : `Greeting released (${reason})`}, ${Date.now() - stream.callStartTime}ms after the call connected`);
+    }
+    hello.waiters.forEach(resolve => resolve());
+    hello.waiters = [];
+  }
+
+  // Resolves when the greeting may play: at once, or for outgoing calls set to
+  // wait, once the customer has said hello or stayed silent for the wait.
+  waitForGreetingTurn(stream) {
+    const hello = stream?.hello;
+    if (!hello || hello.done) return Promise.resolve();
+    if (!stream.greetingWaitMs) {
+      this.finishHello(stream, 'immediate');
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      hello.waiters.push(resolve);
+      if (hello.waitMs == null) {
+        hello.waitMs = stream.greetingWaitMs;
+        const since = Date.now() - stream.callStartTime;
+        // Caller audio drives the checks; the timers cover a stream that sends none.
+        hello.timers.push(setTimeout(() => this.checkHello(stream), Math.max(0, hello.waitMs - since)));
+        hello.timers.push(setTimeout(() => this.finishHello(stream, 'kept talking'), Math.max(0, hello.waitMs + HELLO_MAX_EXTRA_MS - since)));
+      }
+      this.checkHello(stream);
+    });
+  }
+
+  // Which voice provider and voice an utterance uses: the agent's provider
+  // replaces the ElevenLabs default.
+  pickVoice(agent, voiceId, provider = 'elevenlabs') {
+    let activeProvider = provider || 'elevenlabs';
+    let activeVoiceId = voiceId;
+    if (agent && (!provider || provider === 'elevenlabs')) {
+      const agentProvider = agent.voice_provider === 'deepgram' || agent.telephony_provider?.startsWith('deepgram') ? 'deepgram'
+        : agent.voice_provider === 'sarvam_ai' || agent.telephony_provider?.startsWith('sarvam_ai') ? 'sarvam_ai'
+        : agent.voice_provider || null;
+      if (agentProvider) {
+        activeProvider = agentProvider;
+        if (!activeVoiceId && agent.voice_id) activeVoiceId = agent.voice_id;
+      }
+    }
+    if (activeVoiceId && activeVoiceId.startsWith('aura-2-')) {
+      activeVoiceId = activeVoiceId.replace(/^aura-2-/, 'aura-');
+    }
+    return { activeProvider, activeVoiceId };
+  }
+
+  // Same words in another voice model or language sound different, so they are kept apart.
+  ttsCacheKey(provider, voiceId, text, language) {
+    const variant = provider === 'elevenlabs' ? `${elevenLabsService.ttsModel}|${language || ''}` : (language || '');
+    return ttsCache.keyFor(provider, voiceId, text, variant);
+  }
+
+  // Phone audio (8 kHz mu-law, base64) for text, or null when the provider has
+  // no API key. requestedProvider is the provider speak() was asked for; its
+  // apiKey argument only belongs to that provider.
+  async synthesize({ provider, voiceId, text, settings, apiKey, language = null, requestedProvider = 'elevenlabs', deepgramApiKey = null }) {
+    if (provider === 'deepgram') {
+      const dgApiKey = deepgramApiKey || settings?.deepgram_api_key || deepgramService.apiKey;
+      if (!dgApiKey) {
+        console.warn('[TTS] No Deepgram API key found. Falling back to Twilio <Say>.');
+        return null;
+      }
+      const pcmBuffer = await deepgramService.generateSpeech(text, voiceId || 'aura-asteria-en', {}, dgApiKey, 8000);
+      return this.encodePcmToUlaw(pcmBuffer, 8000).toString('base64');
+    }
+
+    if (provider === 'sarvam_ai') {
+      let sarvamApiKey = settings?.sarvam_ai_api_key || sarvamService.apiKey;
+      if (!sarvamApiKey && apiKey && !apiKey.startsWith('sk_75') && !apiKey.startsWith('sk_f1')) {
+        sarvamApiKey = apiKey;
+      }
+      if (!sarvamApiKey) {
+        console.warn('[TTS] No Sarvam AI API key found. Falling back to Twilio <Say>.');
+        return null;
+      }
+      const pcmBuffer = await sarvamService.generateSpeech(text, voiceId || 'shubh', {}, sarvamApiKey, 8000);
+      return this.encodePcmToUlaw(pcmBuffer, pcmBuffer.sampleRate || 8000).toString('base64');
+    }
+
+    const elApiKey = (provider === requestedProvider ? apiKey : null) || settings?.elevenlabs_api_key || elevenLabsService.apiKey;
+    if (!elApiKey) {
+      console.warn('[TTS] No ElevenLabs API key found. Falling back to Twilio <Say>.');
+      return null;
+    }
+    const pcmBuffer = await elevenLabsService.generateSpeech(text, voiceId || 'JBFqnCBsd6RMkjVDRZzb', { language }, elApiKey);
+    return this.encodePcmToUlaw(pcmBuffer, 16000).toString('base64');
+  }
+
+  // Makes audio ahead of time and keeps it (memory + Redis); does nothing if it
+  // is already kept or already being made.
+  warmSpeech({ agent, text, voiceId, settings }) {
+    const { activeProvider, activeVoiceId } = this.pickVoice(agent, voiceId);
+    const language = agent?.language || null;
+    const key = this.ttsCacheKey(activeProvider, activeVoiceId, text, language);
+    if (this.warming.has(key)) return this.warming.get(key);
+    const job = (async () => {
+      if (await ttsCache.get(key)) return;
+      const audio = await this.synthesize({
+        provider: activeProvider,
+        voiceId: activeVoiceId,
+        text,
+        settings,
+        language,
+        apiKey: settings?.elevenlabs_api_key
+      });
+      if (audio) ttsCache.set(key, audio, { persist: true });
+    })().finally(() => this.warming.delete(key));
+    this.warming.set(key, job);
+    return job;
+  }
+
+  // Makes a call's greeting audio before it is needed: while an outgoing call
+  // rings, when an incoming call arrives, or when an agent is saved. Mirrors how
+  // the stream 'start' handler picks the greeting: the flow's opening words when
+  // the call carries a flow, otherwise the agent's first message. Never throws.
+  async prepareGreeting({ agent = null, agentId = null, flowId = null, userId = null, userSettings = null } = {}) {
+    try {
+      const isValidId = (id) => id && db.mongoose.Types.ObjectId.isValid(String(id));
+      let text;
+      let voiceId;
+      if (isValidId(flowId)) {
+        const [flow, flowAgent] = await Promise.all([
+          Flow.findById(flowId).lean(),
+          Agent.findOne({ flow_id: flowId })
+        ]);
+        if (!flow) return;
+        agent = flowAgent;
+        text = automationEngine.openingMessage(flow);
+        voiceId = flow.nodes?.[0]?.data?.voice_id || null;
+      } else {
+        if (!agent && isValidId(agentId)) agent = await Agent.findById(agentId);
+        if (!agent) return;
+        text = this.greetingText(agent);
+        voiceId = agent.voice_id;
+      }
+      if (!text || !text.trim()) return;
+
+      const ownerId = userId || agent?.user_id;
+      const settings = userSettings || (ownerId ? await UserSettings.findOne({ user: ownerId }) : null);
+      const startedAt = Date.now();
+      await this.warmSpeech({ agent, text, voiceId, settings });
+      console.log(`[Greeting] Audio ready in ${Date.now() - startedAt}ms: "${text.substring(0, 45)}"`);
+    } catch (err) {
+      console.warn('[Greeting] Could not prepare greeting audio:', err.message);
+    }
   }
 
   async handlePlaybackComplete(streamSid) {
@@ -280,9 +487,9 @@ class VoiceAutomationService extends EventEmitter {
             // Plivo's extraHeaders may arrive in the start event or on the WebSocket handshake.
             customData = {
               ...this.parsePlivoExtraHeaders(req?.headers?.['x-ph-extraheaders'] || req?.headers?.['extraheaders']),
-              ...Object.fromEntries(['agentid', 'userid', 'flowid']
+              ...Object.fromEntries(['agentid', 'userid', 'flowid', 'direction']
                 .filter(key => req?.headers?.[`x-ph-${key}`] || req?.headers?.[key])
-                .map(key => [{ agentid: 'agentId', userid: 'userId', flowid: 'flowId' }[key], req.headers[`x-ph-${key}`] || req.headers[key]])),
+                .map(key => [{ agentid: 'agentId', userid: 'userId', flowid: 'flowId', direction: 'direction' }[key], req.headers[`x-ph-${key}`] || req.headers[key]])),
               ...this.parsePlivoExtraHeaders(msg.start.extraHeaders || msg.start.extra_headers || msg.extraHeaders)
             };
             // Last resort: plivo-inbound / plivo-xml saved the call with its agent and user.
@@ -317,7 +524,10 @@ class VoiceAutomationService extends EventEmitter {
             processingTurn: true,
             pendingPlaybacks: 0,
             conversationHistory: [],
-            callStartTime: Date.now()
+            callStartTime: Date.now(),
+            // Caller audio before the greeting, to know when they said hello (see waitForGreetingTurn).
+            hello: { speechMs: 0, silenceMs: 0, done: false, waitMs: null, waiters: [], timers: [] },
+            greetingWaitMs: 0
           });
 
           console.log(`Stream started: CallSid=${callSid}, FlowId=${flowId}, AgentId=${agentId}, UserId=${userId}`);
@@ -325,17 +535,21 @@ class VoiceAutomationService extends EventEmitter {
           try {
             const isValidId = (id) => id && db.mongoose.Types.ObjectId.isValid(id);
             const hasFlow = isValidId(flowId);
+            const hasAgent = !hasFlow && isValidId(agentId);
             // Independent lookups run together; each Atlas round trip adds to the silence before the greeting.
-            const [callLog, userSettings, flow, flowAgent] = await Promise.all([
+            const [callLog, userSettings, flow, flowAgent, directAgent] = await Promise.all([
               Call.findOne({ twilio_call_sid: callSid }),
               isValidId(userId) ? UserSettings.findOne({ user: userId }).populate('ai_model') : null,
               hasFlow ? Flow.findById(flowId) : null,
-              hasFlow ? Agent.findOne({ flow_id: flowId }).populate('llm_model', 'model_id provider name') : null
+              hasFlow ? Agent.findOne({ flow_id: flowId }).populate('llm_model', 'model_id provider name') : null,
+              hasAgent ? Agent.findById(agentId).populate('llm_model', 'model_id provider name') : null
             ]);
             const startStream = this.activeStreams.get(streamSid);
             if (startStream) {
-              startStream.agent = hasFlow ? flowAgent : null;
+              startStream.agent = hasFlow ? flowAgent : directAgent;
               startStream.userSettings = userSettings;
+              // The answer URL says which way the call goes; the call log is the fallback.
+              startStream.greetingWaitMs = this.greetingWaitFor(startStream.agent, customData.direction || callLog?.direction);
             }
             console.log(`[Timing] Stream setup lookups took ${Date.now() - startedAt}ms`);
 
@@ -492,13 +706,12 @@ class VoiceAutomationService extends EventEmitter {
                   }
                 }
               }
-            } else if (agentId && db.mongoose.Types.ObjectId.isValid(agentId)) {
-              const agent = await Agent.findById(agentId).populate('llm_model', 'model_id provider name');
+            } else if (hasAgent) {
+              const agent = directAgent;
               const stream = this.activeStreams.get(streamSid);
-              if (stream) stream.agent = agent;
 
               if (agent && callLog) {
-                const greeting = agent.first_message || `Hello! I'm ${agent.name}. How can I help you today?`;
+                const greeting = this.greetingText(agent);
                 if (stream) {
                   stream.conversationHistory = [
                     { role: 'assistant', text: greeting }
@@ -515,7 +728,10 @@ class VoiceAutomationService extends EventEmitter {
             console.error('Error starting stream:', err);
           } finally {
             const startStream = this.activeStreams.get(streamSid);
-            if (startStream) startStream.processingTurn = false;
+            if (startStream) {
+              startStream.processingTurn = false;
+              this.finishHello(startStream, 'no greeting');
+            }
             console.log(`[Timing] Greeting sent ${Date.now() - startedAt}ms after stream start`);
           }
           break;
@@ -523,6 +739,9 @@ class VoiceAutomationService extends EventEmitter {
         case 'media':
           const stream = this.activeStreams.get(streamSid);
           if (stream) {
+            if (!stream.hello.done) this.trackHello(stream, msg.media.payload);
+
+
             // Half-duplex: while the agent is thinking or talking, drop caller
             // audio so its own voice (echo) or an early "hello?" is not taken as an answer.
             if (this.isAgentTurn(stream)) {
@@ -539,7 +758,7 @@ class VoiceAutomationService extends EventEmitter {
             const rms = this.calculateUlawRMS(chunk);
             const chunkMs = chunk.length / 8; // 8 kHz mu-law = 8 bytes per ms
 
-            const SPEECH_THRESHOLD = 800;
+            const SPEECH_THRESHOLD = SPEECH_RMS_THRESHOLD;
             const MIN_SPEECH_MS = 200;     // ignore clicks and short noise bursts
             const END_OF_TURN_SILENCE_MS = 700;   // Responsive turn-taking (cuts dead air by 600ms)
             const MAX_UTTERANCE_MS = 30000; // long interview answers
@@ -1033,111 +1252,54 @@ class VoiceAutomationService extends EventEmitter {
       console.log(`Speaking: "${text}"`);
 
       const stream = this.activeStreams.get(streamSid);
-      let activeProvider = provider || 'elevenlabs';
-      let activeApiKey = apiKey;
-      let activeVoiceId = voiceId;
-
+      let agent = null;
       if (stream && (!provider || provider === 'elevenlabs')) {
-        let agent = stream.agent || null;
+        agent = stream.agent || null;
         if (!agent && stream.agentId) agent = await Agent.findById(stream.agentId);
         else if (!agent && stream.flowId) agent = await Agent.findOne({ flow_id: stream.flowId });
-        if (agent) {
-          if (agent.voice_provider === 'deepgram' || agent.telephony_provider?.startsWith('deepgram')) {
-            activeProvider = 'deepgram';
-            if (!activeVoiceId && agent.voice_id) activeVoiceId = agent.voice_id;
-          } else if (agent.voice_provider === 'sarvam_ai' || agent.telephony_provider?.startsWith('sarvam_ai')) {
-            activeProvider = 'sarvam_ai';
-            if (!activeVoiceId && agent.voice_id) activeVoiceId = agent.voice_id;
-          } else if (agent.voice_provider) {
-            activeProvider = agent.voice_provider;
-            if (!activeVoiceId && agent.voice_id) activeVoiceId = agent.voice_id;
-          }
-        }
+      }
+      const { activeProvider, activeVoiceId } = this.pickVoice(agent, voiceId, provider);
+
+      // The first words of a call are its greeting: the same on most calls, so
+      // they are kept across restarts (often made ahead by prepareGreeting).
+      const isGreeting = !!stream?.hello && !stream.hello.done;
+      const language = agent?.language || null;
+      const cacheKey = this.ttsCacheKey(activeProvider, activeVoiceId, text, language);
+      let base64Audio = await ttsCache.get(cacheKey);
+      if (!base64Audio && this.warming.has(cacheKey)) {
+        await this.warming.get(cacheKey).catch(() => {});
+        base64Audio = await ttsCache.get(cacheKey);
       }
 
-      if (activeVoiceId && activeVoiceId.startsWith('aura-2-')) {
-        activeVoiceId = activeVoiceId.replace(/^aura-2-/, 'aura-');
-      }
-
-      const cacheKey = `${activeProvider}_${activeVoiceId || 'default'}_${text.trim()}`;
-      if (this.ttsAudioCache && this.ttsAudioCache.has(cacheKey)) {
+      if (base64Audio) {
         console.log(`[TTS Cache HIT] Instant 0ms speech playback for: "${text.substring(0, 45)}..."`);
-        if (stream) {
-          stream.audioBuffer = [];
+      } else {
+        const settings = stream?.userSettings || (stream?.userId ? await UserSettings.findOne({ user: stream.userId }) : null);
+        base64Audio = await this.synthesize({
+          provider: activeProvider,
+          voiceId: activeVoiceId,
+          text,
+          settings,
+          apiKey,
+          language,
+          requestedProvider: provider,
+          deepgramApiKey
+        });
+        if (!base64Audio) {
+          await this.waitForGreetingTurn(stream);
+          return await this.speakViaTwiml(streamSid, text);
         }
-        this.sendAgentAudio(ws, streamSid, this.ttsAudioCache.get(cacheKey));
-        return;
-      }
-
-      const cacheAndSend = (base64Audio) => {
         recordUsage({ tts_provider: activeProvider, tts_characters: text.length });
-        if (this.ttsAudioCache) {
-          if (this.ttsAudioCache.size >= 300) {
-            const oldestKey = this.ttsAudioCache.keys().next().value;
-            this.ttsAudioCache.delete(oldestKey);
-          }
-          this.ttsAudioCache.set(cacheKey, base64Audio);
-        }
-        this.sendAgentAudio(ws, streamSid, base64Audio);
-      };
-
-      const settings = stream?.userSettings || (stream?.userId ? await UserSettings.findOne({ user: stream.userId }) : null);
-
-      if (activeProvider === 'deepgram') {
-        let dgApiKey = deepgramApiKey || settings?.deepgram_api_key || deepgramService.apiKey;
-        if (!dgApiKey) {
-          console.warn('[TTS] No Deepgram API key found. Falling back to Twilio <Say>.');
-          return await this.speakViaTwiml(streamSid, text);
-        }
-
-        if (stream) {
-          stream.audioBuffer = [];
-        }
-
-        const pcmBuffer = await deepgramService.generateSpeech(text, activeVoiceId || 'aura-asteria-en', {}, dgApiKey, 8000);
-        const ulawBuffer = this.encodePcmToUlaw(pcmBuffer, 8000);
-        const base64Audio = ulawBuffer.toString('base64');
-        cacheAndSend(base64Audio);
-        return;
+        ttsCache.set(cacheKey, base64Audio, { persist: isGreeting });
       }
 
-      if (activeProvider === 'sarvam_ai') {
-        let sarvamApiKey = settings?.sarvam_ai_api_key || sarvamService.apiKey;
-        if (!sarvamApiKey && apiKey && !apiKey.startsWith('sk_75') && !apiKey.startsWith('sk_f1')) {
-          sarvamApiKey = apiKey;
-        }
-        if (!sarvamApiKey) {
-          console.warn('[TTS] No Sarvam AI API key found. Falling back to Twilio <Say>.');
-          return await this.speakViaTwiml(streamSid, text);
-        }
-
-        if (stream) {
-          stream.audioBuffer = [];
-        }
-
-        const pcmBuffer = await sarvamService.generateSpeech(text, activeVoiceId || 'shubh', {}, sarvamApiKey, 8000);
-        const ulawBuffer = this.encodePcmToUlaw(pcmBuffer, pcmBuffer.sampleRate || 8000);
-        const base64Audio = ulawBuffer.toString('base64');
-        cacheAndSend(base64Audio);
-        return;
-      }
-
-      let elApiKey = (activeProvider === provider ? apiKey : null) || settings?.elevenlabs_api_key || elevenLabsService.apiKey;
-      if (!elApiKey) {
-        console.warn('[TTS] No ElevenLabs API key found. Falling back to Twilio <Say>.');
-        return await this.speakViaTwiml(streamSid, text);
-      }
-
-      if (stream) {
-        stream.audioBuffer = [];
-      }
-
-      const pcmBuffer = await elevenLabsService.generateSpeech(text, activeVoiceId || 'JBFqnCBsd6RMkjVDRZzb', {}, elApiKey);
-      const ulawBuffer = this.encodePcmToUlaw(pcmBuffer, 16000);
-      const base64Audio = ulawBuffer.toString('base64');
-      cacheAndSend(base64Audio);
+      // The audio is made while waiting for the customer's hello, then sent.
+      await this.waitForGreetingTurn(stream);
+      if (!this.activeStreams.has(streamSid)) return;
+      stream.audioBuffer = [];
+      this.sendAgentAudio(ws, streamSid, base64Audio);
     } catch (err) {
-      console.error(`[${provider || activeProvider || 'ElevenLabs'}] TTS failed, falling back to Twilio <Say>:`, err.message);
+      console.error(`[${provider || 'ElevenLabs'}] TTS failed, falling back to Twilio <Say>:`, err.message);
       await this.speakViaTwiml(streamSid, text);
     }
   }

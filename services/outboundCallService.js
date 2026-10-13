@@ -10,6 +10,10 @@ const plivoService = require('./plivoService');
 
 const httpError = (status, message) => Object.assign(new Error(message), { status });
 
+// Starts making the greeting audio so it is ready by the time the call is
+// answered. Loaded on first use: the voice service pulls in much of the app.
+const prepareGreeting = (args) => require('./voiceAutomationService').prepareGreeting(args);
+
 // Places an outbound AI call and returns its call log. Used by the dialer and by
 // WhatsApp automations. Errors carry the HTTP status the dialer should answer with.
 const placeCall = async ({ userId, isAdmin = false, flowId, agentId, phoneNumber, fromNumber }) => {
@@ -86,8 +90,9 @@ const placeCall = async ({ userId, isAdmin = false, flowId, agentId, phoneNumber
       throw httpError(400, 'Plivo settings not configured');
     }
 
-    const xmlUrl = `${appUrl}/api/calls/plivo-xml?flowId=${flowId}&userId=${userId}&agentId=${agent._id.toString()}`;
+    const xmlUrl = `${appUrl}/api/calls/plivo-xml?flowId=${flowId}&userId=${userId}&agentId=${agent._id.toString()}&dir=out&rec=${agent.enable_call_recording ? 1 : 0}`;
     const statusCallbackUrl = `${appUrl}/api/calls/plivo-status`;
+    prepareGreeting({ agent, flowId, userId, userSettings: settings });
 
     const plivoCall = await plivoService.makeCall(
       authId,
@@ -115,8 +120,9 @@ const placeCall = async ({ userId, isAdmin = false, flowId, agentId, phoneNumber
       throw httpError(400, 'Twilio settings not configured');
     }
 
-    const twimlUrl = `${appUrl}/api/calls/twiml?flowId=${flowId}&userId=${userId}&agentId=${agent._id.toString()}`;
+    const twimlUrl = `${appUrl}/api/calls/twiml?flowId=${flowId}&userId=${userId}&agentId=${agent._id.toString()}&dir=out`;
     const statusCallbackUrl = `${appUrl}/api/calls/status`;
+    prepareGreeting({ agent, flowId, userId, userSettings: settings });
 
     const twilioCall = await twilioService.makeCall(
       settings.twilio_account_sid,

@@ -160,6 +160,38 @@ class AutomationEngine {
     return edge ? edge.target : null;
   }
 
+  // What executeFlowSync says when a call starts, worked out without running
+  // any step, so its audio can be made while the phone rings. Returns null when
+  // a step before the first pause does more than speak (webhooks, SMS, AI…).
+  // Keep in step with executeFlowSync and the message / question / end handlers.
+  openingMessage(flow) {
+    const nodes = flow?.nodes || [];
+    const edges = flow?.edges || [];
+    const targets = new Set(edges.map(e => e.target));
+    let node = nodes.find(n => !targets.has(n.id)) || nodes[0];
+    const messages = [];
+
+    for (let steps = 0; node && steps < 50; steps++) {
+      const text = node.data?.description || node.data?.text;
+      if (node.type === 'message_output') {
+        if (text) messages.push(text);
+        if (node.data?.wait_for_response === true) break;
+      } else if (node.type === 'input_capture') {
+        if (text && !/\?\s*$/.test(messages[messages.length - 1] || '')) messages.push(text);
+        break;
+      } else if (node.type === 'terminate_call') {
+        if (text) messages.push(text);
+        break;
+      } else {
+        return null;
+      }
+      const nextId = this.getNextNodeId(flow, node.id);
+      node = nextId ? nodes.find(n => n.id === nextId) : null;
+    }
+
+    return messages.join(' ') || null;
+  }
+
   async executeMessageOutput(node, data) {
     const msg = node.data.description || node.data.text;
     return { success: true, output: { last_message: msg, description: msg } };

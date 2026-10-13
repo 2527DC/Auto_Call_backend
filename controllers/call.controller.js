@@ -18,6 +18,10 @@ const plivoService = require('../services/plivoService');
 const deepgramService = require('../services/deepgramService');
 const outboundCallService = require('../services/outboundCallService');
 
+// Starts making the greeting audio while the call is being connected. Loaded
+// on first use: the voice service pulls in much of the app.
+const prepareGreeting = (args) => require('../services/voiceAutomationService').prepareGreeting(args);
+
 exports.placeCall = async (req, res) => {
   try {
     const { flowId, phoneNumber, fromNumber, agentId } = req.body;
@@ -56,10 +60,13 @@ exports.generateTwiML = async (req, res) => {
     const widgetController = require('./widget.controller');
     return widgetController.handleWidgetVoice(req, res);
   }
-  const { flowId, userId, agentId } = req.query;
+  const { flowId, userId, agentId, dir } = req.query;
   const appUrl = process.env.APP_URL.replace('http', 'ws');
 
   let parametersXml = '';
+  if (dir === 'out') {
+    parametersXml += `<Parameter name="direction" value="outbound" />\n`;
+  }
   if (flowId && flowId !== 'undefined') {
     parametersXml += `<Parameter name="flowId" value="${flowId}" />\n`;
   }
@@ -85,9 +92,9 @@ exports.generateTwiML = async (req, res) => {
 
 // Plivo's <Stream> takes the WebSocket URL as its text and passes context as
 // "key=value;key=value" extraHeaders (it has no Twilio-style <Parameter> children).
-const buildPlivoStreamXml = ({ flowId, agentId, userId, record = false }) => {
+const buildPlivoStreamXml = ({ flowId, agentId, userId, direction = null, record = false }) => {
   const appUrl = process.env.APP_URL.replace('http', 'ws');
-  const headers = Object.entries({ flowId, agentId, userId })
+  const headers = Object.entries({ flowId, agentId, userId, direction })
     .filter(([, value]) => value && value !== 'undefined' && value !== 'null')
     .map(([key, value]) => `${key}=${value}`)
     .join(';');
@@ -105,16 +112,18 @@ const buildPlivoStreamXml = ({ flowId, agentId, userId, record = false }) => {
 };
 
 exports.generatePlivoXML = async (req, res) => {
-  const { flowId, userId, agentId } = req.query;
+  const { flowId, userId, agentId, dir, rec } = req.query;
 
-  let record = false;
-  if (agentId && db.mongoose.Types.ObjectId.isValid(agentId)) {
+  // Calls placed by Voxeno carry the recording choice in the URL, so the answer
+  // needs no database round trip; older URLs still look it up.
+  let record = rec === '1';
+  if (rec === undefined && agentId && db.mongoose.Types.ObjectId.isValid(agentId)) {
     const agent = await Agent.findById(agentId).select('enable_call_recording').lean();
     record = !!agent?.enable_call_recording;
   }
 
   res.type('text/xml');
-  res.send(buildPlivoStreamXml({ flowId, agentId, userId, record }));
+  res.send(buildPlivoStreamXml({ flowId, agentId, userId, record, direction: dir === 'out' ? 'outbound' : null }));
 };
 
 exports.handleStatusCallback = async (req, res) => {
@@ -670,6 +679,7 @@ exports.handleInboundCall = async (req, res) => {
     const flowId = agent.flow_id || null;
     const agentId = agent._id;
     const userId = agent.user_id;
+    prepareGreeting({ agent, flowId, userId });
 
     const contact = await Contact.findOne({ user_id: userId, phone_number: From });
     if (contact && contact.is_blocked) {
@@ -792,6 +802,7 @@ exports.handlePlivoInboundCall = async (req, res) => {
     const flowId = agent.flow_id || null;
     const agentId = agent._id;
     const userId = agent.user_id;
+    prepareGreeting({ agent, flowId, userId });
 
     const contact = await Contact.findOne({ user_id: userId, phone_number: { $in: numberVariants(From) } });
     if (contact && contact.is_blocked) {

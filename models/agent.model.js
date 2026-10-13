@@ -163,6 +163,20 @@ const AgentSchema = new Schema(
       default: null,
       min: 0
     },
+    // Outgoing calls: wait for the customer's "Hello?" before greeting, or greet
+    // the moment the call connects. Incoming calls always greet at once.
+    greeting_mode: {
+      type: String,
+      enum: ['wait_for_hello', 'immediate'],
+      default: 'wait_for_hello'
+    },
+    // With wait_for_hello: greet anyway after this long without a hello.
+    hello_wait_ms: {
+      type: Number,
+      default: 1000,
+      min: 300,
+      max: 3000
+    },
     enable_call_recording: {
       type: Boolean,
       default: false

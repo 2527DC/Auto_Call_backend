@@ -5,6 +5,10 @@ const Flow = db.Flow;
 const automationEngine = require('../utils/automationEngine');
 const { checkFeatureLimit } = require('../utils/limitHelper');
 
+// Remakes the flow's opening audio when it is edited, so the next call plays it
+// instantly. Loaded on first use: the voice service pulls in much of the app.
+const prepareGreeting = (args) => require('../services/voiceAutomationService').prepareGreeting(args);
+
 exports.getFlows = async (req, res) => {
   try {
     const userId = req.user.id;
@@ -118,6 +122,7 @@ exports.updateFlow = async (req, res) => {
     if (!flow) {
       return res.status(404).json({ success: false, message: 'Flow not found' });
     }
+    prepareGreeting({ flowId: flow._id, userId });
 
     res.json({ success: true, message: 'Flow updated successfully', data: flow });
   } catch (error) {

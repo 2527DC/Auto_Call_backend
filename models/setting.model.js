@@ -299,6 +299,14 @@ const SettingSchema = new Schema(
       type: String,
       default: null
     },
+    // Voxeno's own voice-provider keys, used for every client the admin has not
+    // given a key of their own (services/voice/providerKeys.js).
+    elevenlabs_api_key: { type: String, default: null },
+    deepgram_api_key: { type: String, default: null },
+    sarvam_ai_api_key: { type: String, default: null },
+    // ElevenLabs voice models clients may pick for an agent, and the default.
+    elevenlabs_allowed_models: { type: [String], default: ['eleven_v4_turbo'] },
+    elevenlabs_default_model: { type: String, default: 'eleven_v4_turbo' },
     apikey_prefix: {
       type: String,
       default: 'AKK-'

@@ -206,7 +206,7 @@ class WhatsappCallAutomationService {
             return await sarvamService.generateSpeech(text, agent.voice_id || 'shubh', {}, apiKey, 8000);
         } else {
             const apiKey = userSettings?.elevenlabs_api_key;
-            return await elevenLabsService.generateSpeech(text, agent.voice_id || 'JBFqnCBsd6RMkjVDRZzb', { language: agent.language }, apiKey);
+            return await elevenLabsService.generateSpeech(text, agent.voice_id || 'JBFqnCBsd6RMkjVDRZzb', { language: agent.language, model: agent.tts_model }, apiKey);
         }
     }
 

@@ -12,5 +12,7 @@ router.use(authenticate);
 router.get('/', checkPermission('view.voices'), voiceController.getAllVoices);
 router.get('/sync', checkPermission('sync.voices'), voiceController.syncVoices);
 router.post('/synthesize', checkPermission('synthesize.voices'), voiceController.synthesizeSpeech);
+router.get('/models', checkPermission('view.voices'), voiceController.getVoiceModels);
+router.patch('/:voice_id/status', checkPermission('sync.voices'), voiceController.updateVoiceStatus);
 
 module.exports = router;

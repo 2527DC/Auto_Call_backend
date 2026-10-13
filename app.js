@@ -32,6 +32,7 @@ app.use(require('passport').initialize());
 connectDB().then(() => {
   console.log('Database connected.');
   ensurePermissions().catch((err) => console.error('Failed to add new permissions:', err));
+  require('./services/voice/providerKeys').load().catch((err) => console.error('Failed to load voice provider keys:', err));
 });
 
 app.use(

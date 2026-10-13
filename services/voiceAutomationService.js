@@ -322,15 +322,15 @@ class VoiceAutomationService extends EventEmitter {
   }
 
   // Same words in another voice model or language sound different, so they are kept apart.
-  ttsCacheKey(provider, voiceId, text, language) {
-    const variant = provider === 'elevenlabs' ? `${elevenLabsService.ttsModel}|${language || ''}` : (language || '');
+  ttsCacheKey(provider, voiceId, text, language, model = null) {
+    const variant = provider === 'elevenlabs' ? `${elevenLabsService.resolveModel(model)}|${language || ''}` : (language || '');
     return ttsCache.keyFor(provider, voiceId, text, variant);
   }
 
   // Phone audio (8 kHz mu-law, base64) for text, or null when the provider has
   // no API key. requestedProvider is the provider speak() was asked for; its
   // apiKey argument only belongs to that provider.
-  async synthesize({ provider, voiceId, text, settings, apiKey, language = null, requestedProvider = 'elevenlabs', deepgramApiKey = null }) {
+  async synthesize({ provider, voiceId, text, settings, apiKey, language = null, model = null, requestedProvider = 'elevenlabs', deepgramApiKey = null }) {
     if (provider === 'deepgram') {
       const dgApiKey = deepgramApiKey || settings?.deepgram_api_key || deepgramService.apiKey;
       if (!dgApiKey) {
@@ -359,7 +359,7 @@ class VoiceAutomationService extends EventEmitter {
       console.warn('[TTS] No ElevenLabs API key found. Falling back to Twilio <Say>.');
       return null;
     }
-    const pcmBuffer = await elevenLabsService.generateSpeech(text, voiceId || 'JBFqnCBsd6RMkjVDRZzb', { language }, elApiKey);
+    const pcmBuffer = await elevenLabsService.generateSpeech(text, voiceId || 'JBFqnCBsd6RMkjVDRZzb', { language, model }, elApiKey);
     return this.encodePcmToUlaw(pcmBuffer, 16000).toString('base64');
   }
 
@@ -368,7 +368,8 @@ class VoiceAutomationService extends EventEmitter {
   warmSpeech({ agent, text, voiceId, settings }) {
     const { activeProvider, activeVoiceId } = this.pickVoice(agent, voiceId);
     const language = agent?.language || null;
-    const key = this.ttsCacheKey(activeProvider, activeVoiceId, text, language);
+    const model = agent?.tts_model || null;
+    const key = this.ttsCacheKey(activeProvider, activeVoiceId, text, language, model);
     if (this.warming.has(key)) return this.warming.get(key);
     const job = (async () => {
       if (await ttsCache.get(key)) return;
@@ -378,6 +379,7 @@ class VoiceAutomationService extends EventEmitter {
         text,
         settings,
         language,
+        model,
         apiKey: settings?.elevenlabs_api_key
       });
       if (audio) ttsCache.set(key, audio, { persist: true });
@@ -1264,7 +1266,8 @@ class VoiceAutomationService extends EventEmitter {
       // they are kept across restarts (often made ahead by prepareGreeting).
       const isGreeting = !!stream?.hello && !stream.hello.done;
       const language = agent?.language || null;
-      const cacheKey = this.ttsCacheKey(activeProvider, activeVoiceId, text, language);
+      const model = agent?.tts_model || null;
+      const cacheKey = this.ttsCacheKey(activeProvider, activeVoiceId, text, language, model);
       let base64Audio = await ttsCache.get(cacheKey);
       if (!base64Audio && this.warming.has(cacheKey)) {
         await this.warming.get(cacheKey).catch(() => {});
@@ -1282,6 +1285,7 @@ class VoiceAutomationService extends EventEmitter {
           settings,
           apiKey,
           language,
+          model,
           requestedProvider: provider,
           deepgramApiKey
         });

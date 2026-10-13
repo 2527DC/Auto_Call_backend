@@ -15,6 +15,8 @@ router.get('/import-template', checkPermission('view.members'), userController.d
 router.put('/update', uploadSingle('avatars','avatar'), checkPermission('update.members'), userController.updateUser);
 router.put('/:id/update/status', checkPermission('update.members'), userController.updateUserStatus);
 router.post('/add-bonus-credits', checkPermission('update.members'), userController.addBonusCredits);
+router.get('/:id/provider-keys', checkPermission('update.members'), userController.getProviderKeys);
+router.put('/:id/provider-keys', checkPermission('update.members'), userController.updateProviderKeys);
 router.delete('/delete', checkPermission('delete.members'), userController.deleteUser);
 
 module.exports = router;

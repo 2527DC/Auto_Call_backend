@@ -3,6 +3,16 @@ const fs = require('fs-extra');
 const path = require('path');
 const FormData = require('form-data');
 
+// Bulbul v3 speakers, from docs.sarvam.ai (text-to-speech API, 13 Oct 2026).
+const BULBUL_V3_SPEAKERS = ['shubh', 'aditya', 'ritu', 'priya', 'neha', 'rahul', 'pooja', 'rohan', 'simran', 'kavya', 'amit', 'dev', 'ishita', 'shreya', 'ratan', 'varun', 'manan', 'sumit', 'roopa', 'kabir', 'aayan', 'ashutosh', 'advait', 'anand', 'tanya', 'tarun', 'sunny', 'mani', 'gokul', 'vijay', 'shruti', 'suhani', 'mohit', 'kavitha', 'rehan', 'soham', 'rupali'];
+
+// Older speaker names (Bulbul v1/v2) that agents may still use, each mapped to a
+// v3 speaker with a similar name, so those agents keep a voice instead of failing.
+const LEGACY_SPEAKERS = {
+  meera: 'ritu', divya: 'neha', anushka: 'priya', manisha: 'pooja', vidya: 'kavya', arya: 'shreya',
+  pavithra: 'kavitha', abhilash: 'aditya', karun: 'rahul', hitesh: 'rohan', yash: 'rehan', amartya: 'ashutosh'
+};
+
 class SarvamService {
   constructor() {
     this.apiKey = process.env.SARVAM_API_KEY || process.env.SERVAM_API_KEY;
@@ -16,22 +26,8 @@ class SarvamService {
     }
 
     try {
-      const validSpeakers = new Set(['anushka', 'abhilash', 'manisha', 'vidya', 'arya', 'karun', 'hitesh', 'aditya', 'ritu', 'priya', 'neha', 'rahul', 'pooja', 'rohan', 'simran', 'kavya', 'amit', 'dev', 'ishita', 'shreya', 'ratan', 'varun', 'manan', 'sumit', 'roopa', 'kabir', 'aayan', 'shubh', 'ashutosh', 'advait', 'anand', 'tanya', 'tarun', 'sunny', 'mani', 'gokul', 'vijay', 'shruti', 'suhani', 'mohit', 'kavitha', 'rehan', 'soham', 'rupali']);
-      const speakerMap = {
-        'yash': 'rehan',
-        'meera': 'manisha',
-        'pavithra': 'kavitha',
-        'divya': 'vidya',
-        'amartya': 'ashutosh'
-      };
-      let speaker = voiceId || 'shubh';
-      if (speakerMap[speaker.toLowerCase()]) {
-        speaker = speakerMap[speaker.toLowerCase()];
-      } else if (!validSpeakers.has(speaker.toLowerCase())) {
-        speaker = 'shubh';
-      } else {
-        speaker = speaker.toLowerCase();
-      }
+      const requested = String(voiceId || 'shubh').toLowerCase();
+      const speaker = LEGACY_SPEAKERS[requested] || (BULBUL_V3_SPEAKERS.includes(requested) ? requested : 'shubh');
       const targetLang = voiceSettings.target_language_code || voiceSettings.language || 'hi-IN';
 
       const response = await axios({
@@ -155,19 +151,17 @@ class SarvamService {
     }
   }
 
+  // Sarvam has no voice-list API; these are Bulbul v3's speakers. Each speaks
+  // all of Bulbul's languages (Indian English, Hindi, Kannada and more).
   async fetchVoices(apiKey = null) {
-    return [
-      { name: 'Shubh (Sarvam AI)', voice_id: 'shubh', category: 'Predefined', provider: 'sarvam_ai', preview_url: null, labels: { gender: 'Male', age: 'Young', accent: 'Indian (Hindi/English)', description: 'Clear and natural conversational voice' } },
-      { name: 'Roopa (Sarvam AI)', voice_id: 'roopa', category: 'Predefined', provider: 'sarvam_ai', preview_url: null, labels: { gender: 'Female', age: 'Young', accent: 'Indian (Hindi/English)', description: 'Warm and engaging voice' } },
-      { name: 'Meera (Sarvam AI)', voice_id: 'meera', category: 'Predefined', provider: 'sarvam_ai', preview_url: null, labels: { gender: 'Female', age: 'Middle-aged', accent: 'Indian (Hindi/English)', description: 'Professional and calm voice' } },
-      { name: 'Pavithra (Sarvam AI)', voice_id: 'pavithra', category: 'Predefined', provider: 'sarvam_ai', preview_url: null, labels: { gender: 'Female', age: 'Young', accent: 'Indian (South/English)', description: 'Melodic and expressive voice' } },
-      { name: 'Divya (Sarvam AI)', voice_id: 'divya', category: 'Predefined', provider: 'sarvam_ai', preview_url: null, labels: { gender: 'Female', age: 'Young', accent: 'Indian (Hindi/English)', description: 'Upbeat and energetic voice' } },
-      { name: 'Amartya (Sarvam AI)', voice_id: 'amartya', category: 'Predefined', provider: 'sarvam_ai', preview_url: null, labels: { gender: 'Male', age: 'Middle-aged', accent: 'Indian (Hindi/English)', description: 'Authoritative and articulate voice' } },
-      { name: 'Yash (Sarvam AI)', voice_id: 'yash', category: 'Predefined', provider: 'sarvam_ai', preview_url: null, labels: { gender: 'Male', age: 'Young', accent: 'Indian (Hindi/English)', description: 'Friendly and dynamic voice' } },
-      { name: 'Rahul (Sarvam AI)', voice_id: 'rahul', category: 'Predefined', provider: 'sarvam_ai', preview_url: null, labels: { gender: 'Male', age: 'Young', accent: 'Indian (Hindi/English)', description: 'Smooth and modern conversational voice' } },
-      { name: 'Anushka (Sarvam AI)', voice_id: 'anushka', category: 'Predefined', provider: 'sarvam_ai', preview_url: null, labels: { gender: 'Female', age: 'Young', accent: 'Indian (Hindi/English)', description: 'Sweet and articulate voice' } },
-      { name: 'Priya (Sarvam AI)', voice_id: 'priya', category: 'Predefined', provider: 'sarvam_ai', preview_url: null, labels: { gender: 'Female', age: 'Young', accent: 'Indian (Hindi/English)', description: 'Polite and clear guiding voice' } }
-    ];
+    return BULBUL_V3_SPEAKERS.map((id) => ({
+      name: `${id.charAt(0).toUpperCase()}${id.slice(1)} (Sarvam AI)`,
+      voice_id: id,
+      category: 'Predefined',
+      provider: 'sarvam_ai',
+      preview_url: null,
+      labels: { gender: null, age: null, accent: 'Indian', description: 'Bulbul v3 voice' }
+    }));
   }
 }
 

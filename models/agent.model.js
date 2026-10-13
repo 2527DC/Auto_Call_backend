@@ -101,6 +101,12 @@ const AgentSchema = new Schema(
       type: String,
       default: null
     },
+    // ElevenLabs voice model for this agent; null (or a model the admin no
+    // longer allows) uses the admin's default (elevenlabsService.resolveModel).
+    tts_model: {
+      type: String,
+      default: null
+    },
     language: {
       type: String,
       default: 'en'

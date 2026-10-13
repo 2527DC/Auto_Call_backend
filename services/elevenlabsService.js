@@ -5,16 +5,39 @@ const FormData = require('form-data');
 
 class ElevenLabsService {
   constructor() {
-    // eleven_v4_turbo answers in about 100 ms and speaks 90+ languages, including
-    // Hindi and Kannada (eleven_turbo_v2 is deprecated and English-only).
-    // ELEVENLABS_TTS_MODEL overrides it, e.g. eleven_flash_v2_5.
-    this.ttsModel = process.env.ELEVENLABS_TTS_MODEL || 'eleven_v4_turbo';
+    this.setModelChoices();
     this.apiKey = process.env.ELEVENLABS_API_KEY;
     this.baseUrl = 'https://api.elevenlabs.io/v1';
   }
 
-  // voiceSettings.language: the agent's language ("kn", "hi-IN", …). It is sent
-  // as ISO 639-1 so the model reads the text as that language.
+  // Voice models clients may pick for an agent, and the one used otherwise (set
+  // by the admin, see services/voice/providerKeys.js). eleven_v4_turbo answers in
+  // about 100 ms and speaks 90+ languages, including Hindi and Kannada;
+  // ELEVENLABS_TTS_MODEL can change the default when the admin has not.
+  setModelChoices(allowed = null, defaultModel = null) {
+    this.defaultModel = defaultModel || process.env.ELEVENLABS_TTS_MODEL || 'eleven_v4_turbo';
+    const list = Array.isArray(allowed) && allowed.length ? allowed : [];
+    this.allowedModels = list.includes(this.defaultModel) ? list : [this.defaultModel, ...list];
+  }
+
+  // An agent's own model while the admin still allows it, otherwise the default.
+  resolveModel(requested = null) {
+    return requested && this.allowedModels.includes(requested) ? requested : this.defaultModel;
+  }
+
+  // Text-to-speech models on the account (GET /v1/models).
+  async fetchModels(apiKey = null) {
+    const response = await axios({
+      method: 'GET',
+      url: `${this.baseUrl}/models`,
+      headers: { 'xi-api-key': apiKey || this.apiKey }
+    });
+    return (response.data || []).filter(m => m.can_do_text_to_speech);
+  }
+
+  // voiceSettings.language: the agent's language ("kn", "hi-IN", …), sent as
+  // ISO 639-1 so the model reads the text as that language.
+  // voiceSettings.model: the agent's chosen voice model (see resolveModel).
   async generateSpeech(text, voiceId, voiceSettings = {}, apiKey = null) {
     const activeApiKey = apiKey || this.apiKey;
     if (!activeApiKey) {
@@ -29,7 +52,7 @@ class ElevenLabsService {
         url: `${this.baseUrl}/text-to-speech/${voiceId}?output_format=${outputFormat}`,
         data: {
           text,
-          model_id: this.ttsModel,
+          model_id: this.resolveModel(voiceSettings.model),
           ...(languageCode ? { language_code: languageCode } : {}),
           voice_settings: {
             stability: voiceSettings.stability || 0.5,

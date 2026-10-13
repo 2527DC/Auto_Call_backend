@@ -493,3 +493,41 @@ exports.addBonusCredits = async (req, res) => {
     return res.status(500).json({ message: 'Internal server error' });
   }
 };
+// Voice-provider keys the admin made for one client inside Voxeno's own
+// ElevenLabs / Deepgram / Sarvam accounts, so each provider shows that client's
+// usage per key. Calls use them instead of Voxeno's platform keys. Only the last
+// 4 characters are ever sent back.
+const PROVIDER_KEY_FIELDS = ['elevenlabs_api_key', 'deepgram_api_key', 'sarvam_ai_api_key'];
+const maskKey = (val) => (val ? `${'*'.repeat(Math.max(val.length - 4, 0))}${val.slice(-4)}` : '');
+
+exports.getProviderKeys = async (req, res) => {
+  try {
+    const settings = await UserSettings.findOne({ user: req.params.id }).select(PROVIDER_KEY_FIELDS.join(' ')).lean();
+    const data = Object.fromEntries(PROVIDER_KEY_FIELDS.map((field) => [field, maskKey(settings?.[field])]));
+    return res.status(200).json({ success: true, data });
+  } catch (error) {
+    console.error('Get Provider Keys Error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load provider keys' });
+  }
+};
+
+// Body: any of the key fields. A masked value (unchanged) is ignored; an empty
+// string removes the client's key, so Voxeno's platform key is used again.
+exports.updateProviderKeys = async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id).select('_id');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const update = {};
+    for (const field of PROVIDER_KEY_FIELDS) {
+      const value = req.body[field];
+      if (value === undefined || /^\*+/.test(value)) continue;
+      update[field] = String(value).trim() || null;
+    }
+    await UserSettings.updateOne({ user: user._id }, { $set: update }, { upsert: true });
+    return res.status(200).json({ success: true, message: 'Provider keys saved' });
+  } catch (error) {
+    console.error('Update Provider Keys Error:', error);
+    return res.status(500).json({ success: false, message: 'Failed to save provider keys' });
+  }
+};

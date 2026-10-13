@@ -118,6 +118,9 @@ exports.createAgent = async (req, res) => {
     await checkFeatureLimit(userId, 'Agent', 'agent_limit', currentAgentsCount);
 
     const agentData = { ...req.body, user_id: userId };
+    if (agentData.tts_model && !elevenlabsService.allowedModels.includes(agentData.tts_model)) {
+      return res.status(400).json({ success: false, message: 'This voice model is not available. Choose another one.' });
+    }
 
     if (agentData.knowledge_base && !Array.isArray(agentData.knowledge_base)) {
       agentData.knowledge_base = [agentData.knowledge_base];
@@ -243,6 +246,9 @@ exports.updateAgent = async (req, res) => {
     const { id } = req.params;
     const userId = req.user.id;
     const updateData = { ...req.body };
+    if (updateData.tts_model && !elevenlabsService.allowedModels.includes(updateData.tts_model)) {
+      return res.status(400).json({ success: false, message: 'This voice model is not available. Choose another one.' });
+    }
 
     if (updateData.knowledge_base && !Array.isArray(updateData.knowledge_base)) {
       updateData.knowledge_base = [updateData.knowledge_base];

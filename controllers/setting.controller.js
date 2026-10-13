@@ -5,6 +5,8 @@ const Language = db.Language;
 const fs = require('fs');
 const path = require('path');
 const { sendTemplateMail } = require('../utils/mail');
+const providerKeys = require('../services/voice/providerKeys');
+const voiceCatalog = require('../services/voice/voiceCatalog');
 
 const updateEnvFile = (settings) => {
   try {
@@ -95,7 +97,11 @@ exports.updateSettings = async (req, res) => {
       'storage_type', 'storage_limit_per_user', 'aws_access_key_id', 'aws_secret_access_key',
       'aws_region', 'aws_bucket_name', 'restore_storage_on_delete'
     ];
-    const aiFields = ['openai_api_key'];
+    const aiFields = [
+      'openai_api_key', 'elevenlabs_api_key', 'deepgram_api_key', 'sarvam_ai_api_key',
+      'elevenlabs_allowed_models', 'elevenlabs_default_model'
+    ];
+    const voiceKeyFields = ['elevenlabs_api_key', 'deepgram_api_key', 'sarvam_ai_api_key'];
     const demoFields = ['demo_user_email', 'demo_user_password', 'is_demo_mode'];
     const widgetFields = ['login_widget_key'];
     const creditFields = ['credit_deduction_type', 'credits_per_call', 'credits_per_minute', 'free_credits_on_registration', 'credits_per_sms',
@@ -256,6 +262,15 @@ exports.updateSettings = async (req, res) => {
     await Setting.updateOne({}, { $set: updateData }, { upsert: true });
 
     const updatedSettings = await Setting.findOne().lean({ virtuals: true });
+
+    // New voice-provider keys or model choices take effect at once, and new
+    // keys bring that account's voices in (hidden from clients until switched on).
+    providerKeys.apply(updatedSettings || {});
+    if (voiceKeyFields.some((field) => updateData[field] && updateData[field] !== settings[field])) {
+      voiceCatalog.syncVoices()
+        .then(({ synced, errors }) => console.log(`[Voices] Synced ${synced} voices after provider keys changed${errors.length ? ` (${errors.join('; ')})` : ''}`))
+        .catch((err) => console.error('[Voices] Sync after key change failed:', err.message));
+    }
 
     updateEnvFile(updatedSettings);
 

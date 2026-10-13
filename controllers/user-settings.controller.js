@@ -18,6 +18,10 @@ const isMasked = (val) => {
   return typeof val === 'string' && /^\*+/.test(val);
 };
 
+// Voice-provider keys are Voxeno's: an admin sets them (Settings, or a client's
+// own key from Members), so clients can't change them here.
+const managesVoiceKeys = (user) => ['super_admin', 'admin'].includes(user?.roleId?.name);
+
 exports.updateUserSetting = async (req, res) => {
   try {
     const userId = req.user.id;
@@ -59,9 +63,11 @@ exports.updateUserSetting = async (req, res) => {
       userSettings = new UserSettings({ user: userId });
     }
 
-    if (elevenlabs_api_key !== undefined && !isMasked(elevenlabs_api_key)) userSettings.elevenlabs_api_key = elevenlabs_api_key;
-    if (deepgram_api_key !== undefined && !isMasked(deepgram_api_key)) userSettings.deepgram_api_key = deepgram_api_key;
-    if (sarvam_ai_api_key !== undefined && !isMasked(sarvam_ai_api_key)) userSettings.sarvam_ai_api_key = sarvam_ai_api_key;
+    if (managesVoiceKeys(req.user)) {
+      if (elevenlabs_api_key !== undefined && !isMasked(elevenlabs_api_key)) userSettings.elevenlabs_api_key = elevenlabs_api_key;
+      if (deepgram_api_key !== undefined && !isMasked(deepgram_api_key)) userSettings.deepgram_api_key = deepgram_api_key;
+      if (sarvam_ai_api_key !== undefined && !isMasked(sarvam_ai_api_key)) userSettings.sarvam_ai_api_key = sarvam_ai_api_key;
+    }
     if (twilio_account_sid !== undefined) userSettings.twilio_account_sid = twilio_account_sid;
     if (twilio_auth_token !== undefined && !isMasked(twilio_auth_token)) userSettings.twilio_auth_token = twilio_auth_token;
     if (twilio_api_key !== undefined && !isMasked(twilio_api_key)) userSettings.twilio_api_key = twilio_api_key;

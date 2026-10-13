@@ -65,6 +65,22 @@ const STILL_THERE = {
 };
 const DEFAULT_GOODBYE = 'Goodbye! Thank you for calling.';
 
+// The caller may talk over the agent. Speech that cuts it off must be louder
+// than ordinary speech (so a little echo of the agent's own voice or room noise
+// does not) and last a moment (so a cough or a click does not), set per agent
+// by interruption_sensitivity.
+const INTERRUPTION_RULES = {
+  low: { speechMs: 700, rms: SPEECH_RMS_THRESHOLD * 2 },
+  medium: { speechMs: 400, rms: SPEECH_RMS_THRESHOLD * 1.5 },
+  high: { speechMs: 250, rms: SPEECH_RMS_THRESHOLD },
+};
+const BARGE_IN_GAP_MS = 300;    // a longer pause starts the count again
+const BARGE_IN_GRACE_MS = 500;  // each utterance plays this long before it can be cut
+// A reply cut off by what turns out to be noise, or only "hmm" or "ok", is
+// finished from the start of the cut sentence if the caller spoke this recently.
+const RESUME_WITHIN_MS = 15000;
+const FILLER_WORD = /^(h?m+|mhm+|hm+|uh+|um+|huh|aha|ok+|okay|achh?a|accha|हम्म*|अच्छा|ओके|ಹ್ಮ್*|ಓಕೆ)$/;
+
 class VoiceAutomationService extends EventEmitter {
   constructor() {
     super();
@@ -137,21 +153,35 @@ class VoiceAutomationService extends EventEmitter {
     }, {});
   }
 
-  // Sends one synthesized utterance (8 kHz mu-law, base64) and signals when playback ends.
-  sendAgentAudio(ws, streamSid, base64Audio) {
+  // Sends one synthesized utterance (8 kHz mu-law, base64) and signals when
+  // playback ends. spoken: its text and voice, so a reply the caller cuts off
+  // can be shortened in the conversation, or finished (see interruptAgent).
+  sendAgentAudio(ws, streamSid, base64Audio, spoken = {}) {
     const stream = this.activeStreams.get(streamSid);
-    // Caller audio is ignored until this utterance has finished playing
-    // (see handlePlaybackComplete), so the agent never answers its own echo.
-    if (stream) stream.pendingPlaybacks = (stream.pendingPlaybacks || 0) + 1;
+    const audio = Buffer.from(base64Audio, 'base64');
+    // Caller audio is not taken as a turn until this utterance has finished
+    // playing (see handlePlaybackComplete), so the agent never answers its own
+    // echo; only clear speech cuts it short (see watchForBargeIn).
+    if (stream) {
+      if (!stream.pendingPlaybacks) stream.playing = [];
+      stream.pendingPlaybacks = (stream.pendingPlaybacks || 0) + 1;
+      // Utterances queue up and play at 8000 mu-law bytes per second.
+      const startsAt = Math.max(Date.now(), stream.playbackEndsAt || 0);
+      stream.playbackEndsAt = startsAt + Math.ceil(audio.length / 8);
+      stream.playing.push({ text: spoken.text || '', voiceId: spoken.voiceId || null, startsAt, endsAt: stream.playbackEndsAt });
+    }
+    // Bumped when the caller cuts the agent off, so the end of audio that was
+    // dropped is not taken for the end of what plays next.
+    const playback = stream?.playbackGen || 0;
 
     if (stream?.provider !== 'plivo') {
       ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: base64Audio } }));
-      ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'agent-speech-completed' } }));
+      // Twilio returns the mark once the audio has played, or at once for audio a 'clear' dropped.
+      ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: `agent-speech-${playback}` } }));
       return;
     }
 
     // Plivo caps WebSocket messages at 64 KB, so send about one second per message.
-    const audio = Buffer.from(base64Audio, 'base64');
     const CHUNK_BYTES = 8000;
     for (let offset = 0; offset < audio.length; offset += CHUNK_BYTES) {
       ws.send(JSON.stringify({
@@ -165,12 +195,11 @@ class VoiceAutomationService extends EventEmitter {
     }
 
     // Plivo queues audio; fire the "speech finished" step when this utterance
-    // should have finished playing (8000 mu-law bytes per second).
-    const now = Date.now();
-    stream.playbackEndsAt = Math.max(now, stream.playbackEndsAt || 0) + Math.ceil(audio.length / 8);
+    // should have finished playing.
     setTimeout(() => {
+      if ((stream.playbackGen || 0) !== playback) return;
       this.handlePlaybackComplete(streamSid).catch(err => console.error('[Plivo] Playback completion error:', err.message));
-    }, stream.playbackEndsAt - now + 300);
+    }, stream.playbackEndsAt - Date.now() + 300);
   }
 
   setIo(io) {
@@ -256,9 +285,166 @@ class VoiceAutomationService extends EventEmitter {
     console.log(`Stream stopped: ${streamSid}`);
   }
 
-  // True while the agent is thinking or talking, or saying goodbye; caller audio is dropped then.
+  // True while the agent is thinking or talking, or saying goodbye.
   isAgentTurn(stream) {
     return stream.ending || stream.processingTurn || stream.pendingPlaybacks > 0 || Date.now() < (stream.listenAfter || 0);
+  }
+
+  // How much caller speech cuts the agent off, or null when it may not be interrupted.
+  interruptionRule(agent) {
+    if (agent?.allow_interruptions === false) return null;
+    return INTERRUPTION_RULES[agent?.interruption_sensitivity] || INTERRUPTION_RULES.medium;
+  }
+
+  // Whether caller audio counts towards their next turn (while the agent
+  // talks it goes to watchForBargeIn instead). While the AI works on a reply
+  // in free conversation the caller is still heard; a flow waits for its step.
+  hearsCaller(stream) {
+    if (stream.ending) return false;
+    if (stream.callerHasFloor) return true;
+    if (stream.pendingPlaybacks > 0 || Date.now() < (stream.listenAfter || 0)) return false;
+    if (!stream.processingTurn) return true;
+    return !!stream.answering && !stream.flowId && !!this.interruptionRule(stream.agent);
+  }
+
+  // Drops buffered caller audio older than the lead-in kept before speech.
+  keepLeadIn(stream) {
+    let bufferedMs = stream.audioBuffer.reduce((ms, c) => ms + c.length / 8, 0);
+    while (bufferedMs > PRE_ROLL_MS && stream.audioBuffer.length > 1) {
+      bufferedMs -= stream.audioBuffer.shift().length / 8;
+    }
+  }
+
+  // While the agent talks: clear speech from the caller stops it, and what
+  // they have said so far starts their turn. The goodbye, a transfer notice and
+  // the first moment of each utterance cannot be cut.
+  watchForBargeIn(stream, streamSid, ws, chunk, rms) {
+    const rule = this.interruptionRule(stream.agent);
+    const now = Date.now();
+    const current = (stream.playing || []).find(p => now < p.endsAt);
+    const interruptible = rule && stream.playing?.length && !stream.pendingTerminate && !stream.pendingTransfer
+      && (!current || now - current.startsAt >= BARGE_IN_GRACE_MS);
+    if (!interruptible) {
+      stream.bargeIn = null;
+      if (stream.audioBuffer.length) {
+        stream.audioBuffer = [];
+        stream.isSpeaking = false;
+        stream.silenceMs = 0;
+        stream.speechMs = 0;
+      }
+      return;
+    }
+
+    const barge = stream.bargeIn || (stream.bargeIn = { speechMs: 0, silenceMs: 0 });
+    const chunkMs = chunk.length / 8;
+    stream.audioBuffer.push(chunk);
+    if (rms > rule.rms) {
+      barge.speechMs += chunkMs;
+      barge.silenceMs = 0;
+    } else {
+      barge.silenceMs += chunkMs;
+      if (barge.silenceMs >= BARGE_IN_GAP_MS) barge.speechMs = 0;
+    }
+    if (!barge.speechMs) {
+      this.keepLeadIn(stream);
+      return;
+    }
+    if (barge.speechMs < rule.speechMs) return;
+
+    this.interruptAgent(stream, streamSid, ws, now);
+    this.giveCallerTheFloor(stream, barge);
+  }
+
+  // The caller is talking: their audio so far is kept and the turn continues
+  // through the usual end-of-speech check.
+  giveCallerTheFloor(stream, barge) {
+    stream.bargeIn = null;
+    stream.callerHasFloor = true;
+    stream.isSpeaking = true;
+    stream.speechMs = barge.speechMs;
+    stream.silenceMs = barge.silenceMs;
+    stream.quietSince = Date.now();
+    stream.idleCheckedIn = false;
+  }
+
+  // Stops the agent mid-sentence. The conversation sent to the AI then shows
+  // only the part the caller heard, and the rest is kept in case the caller
+  // turns out to have said nothing (see resumeUnheard).
+  interruptAgent(stream, streamSid, ws, now = Date.now()) {
+    ws.send(JSON.stringify(stream.provider === 'plivo'
+      ? { event: 'clearAudio', streamId: streamSid }
+      : { event: 'clear', streamSid }));
+    stream.playbackGen = (stream.playbackGen || 0) + 1;
+    stream.pendingPlaybacks = 0;
+    stream.playbackEndsAt = 0;
+    stream.listenAfter = 0;
+    const playing = stream.playing || [];
+    stream.playing = [];
+
+    const at = playing.findIndex(p => now < p.endsAt);
+    if (at === -1) return;
+    const current = playing[at];
+    const { heard, rest } = this.splitSpokenText(current.text, (now - current.startsAt) / Math.max(1, current.endsAt - current.startsAt));
+    const entry = [...(stream.conversationHistory || [])].reverse().find(m => m.role === 'assistant' && m.text === current.text);
+    if (entry) {
+      entry.text = heard || '…';
+      entry.interrupted = true;
+    }
+    const unheard = [rest, ...playing.slice(at + 1).map(p => p.text)].filter(Boolean).join(' ');
+    stream.unheard = unheard ? {
+      text: unheard,
+      voiceId: current.voiceId,
+      at: now,
+      restore: entry ? () => { entry.text = current.text; entry.interrupted = false; } : null,
+    } : null;
+    console.log(`[Barge-in] Caller cut the agent off ${((now - current.startsAt) / 1000).toFixed(1)}s into "${current.text.substring(0, 45)}"`);
+  }
+
+  // Splits a reply where the caller stopped hearing it (fraction of its
+  // playing time): the words heard, and the rest from the start of that sentence.
+  splitSpokenText(text, fraction) {
+    const cut = Math.round(text.length * Math.max(0, Math.min(1, fraction)));
+    if (cut >= text.length) return { heard: text, rest: '' };
+    const before = text.slice(0, cut);
+    const lastSpace = before.lastIndexOf(' ');
+    const heard = lastSpace > 0 ? `${before.slice(0, lastSpace).trim()}…` : '';
+    const sentenceEnds = [...before.matchAll(/[.!?।॥]+\s+/g)];
+    const last = sentenceEnds[sentenceEnds.length - 1];
+    const rest = text.slice(last ? last.index + last[0].length : 0).trim();
+    return { heard, rest };
+  }
+
+  // Only "hmm", "ok" and the like: the caller is listening, not taking a turn.
+  isFillerOnly(text) {
+    const words = String(text).toLowerCase().replace(/[.,!?।॥…'"-]+/g, ' ').split(/\s+/).filter(Boolean);
+    return words.length > 0 && words.length <= 3 && words.every(w => FILLER_WORD.test(w));
+  }
+
+  // Finishes the reply the caller cut off when they said nothing after all.
+  async resumeUnheard(stream, streamSid, ws, heard = '') {
+    const unheard = stream.unheard;
+    stream.unheard = null;
+    if (!unheard || stream.ending || Date.now() - unheard.at > RESUME_WITHIN_MS) return;
+    console.log(`[Barge-in] Caller said ${heard ? `only "${heard}"` : 'nothing'}; finishing the agent's reply`);
+    unheard.restore?.();
+    await this.speak(ws, streamSid, unheard.text, unheard.voiceId, stream.userSettings?.elevenlabs_api_key);
+  }
+
+  // Free conversation, reply ready: true when the caller has said more since,
+  // so playing it would talk over them or answer half of what they said.
+  callerKeptTalking(stream) {
+    const rule = this.interruptionRule(stream.agent);
+    return !!rule && (!!stream.heldAudio || (stream.isSpeaking && stream.speechMs >= rule.speechMs));
+  }
+
+  // Answers words the caller finished while their previous turn was still being handled.
+  answerHeldWords(streamSid, ws) {
+    const stream = this.activeStreams.get(streamSid);
+    if (!stream?.heldAudio || stream.processingTurn) return;
+    const audio = stream.heldAudio;
+    stream.heldAudio = null;
+    if (stream.ending || stream.pendingTransfer) return;
+    this.handleCompleteSpeech(streamSid, ws, audio).catch(err => console.error(err));
   }
 
   greetingText(agent) {
@@ -460,16 +646,25 @@ class VoiceAutomationService extends EventEmitter {
     if (streamForMark && streamForMark.pendingPlaybacks > 0) {
       streamForMark.pendingPlaybacks--;
       if (streamForMark.pendingPlaybacks === 0) {
-        // Short grace period so the tail of the agent's own voice is not captured.
-        streamForMark.listenAfter = Date.now() + 300;
-        streamForMark.audioBuffer = [];
-        streamForMark.isSpeaking = false;
-        streamForMark.silenceMs = 0;
-        streamForMark.speechMs = 0;
-        // Silence is counted from the end of the agent's reply, but not from
-        // its own "are you still there?", so the call still ends on time.
-        if (!streamForMark.idleCheckedIn) streamForMark.quietSince = Date.now();
-        console.log(`[Turn] Agent finished speaking, listening to caller (${streamSid})`);
+        streamForMark.playing = [];
+        const barge = streamForMark.bargeIn;
+        streamForMark.bargeIn = null;
+        if (barge?.speechMs && !streamForMark.ending) {
+          // The caller started talking as the agent finished: keep their words.
+          this.giveCallerTheFloor(streamForMark, barge);
+          console.log(`[Turn] Agent finished speaking, caller already talking (${streamSid})`);
+        } else {
+          // Short grace period so the tail of the agent's own voice is not captured.
+          streamForMark.listenAfter = Date.now() + 300;
+          streamForMark.audioBuffer = [];
+          streamForMark.isSpeaking = false;
+          streamForMark.silenceMs = 0;
+          streamForMark.speechMs = 0;
+          // Silence is counted from the end of the agent's reply, but not from
+          // its own "are you still there?", so the call still ends on time.
+          if (!streamForMark.idleCheckedIn) streamForMark.quietSince = Date.now();
+          console.log(`[Turn] Agent finished speaking, listening to caller (${streamSid})`);
+        }
       }
     }
     if (streamForMark && streamForMark.pendingTransfer) {
@@ -841,81 +1036,88 @@ class VoiceAutomationService extends EventEmitter {
               startStream.processingTurn = false;
               this.finishHello(startStream, 'no greeting');
               this.startCallTimers(streamSid, ws);
+              this.answerHeldWords(streamSid, ws);
             }
             console.log(`[Timing] Greeting sent ${Date.now() - startedAt}ms after stream start`);
           }
           break;
 
-        case 'media':
+        case 'media': {
           const stream = this.activeStreams.get(streamSid);
-          if (stream) {
-            if (!stream.hello.done) this.trackHello(stream, msg.media.payload);
+          if (!stream) break;
+          if (!stream.hello.done) this.trackHello(stream, msg.media.payload);
+          const chunk = Buffer.from(msg.media.payload, 'base64');
+          const rms = this.calculateUlawRMS(chunk);
 
+          if (stream.pendingPlaybacks > 0 && !stream.callerHasFloor && !stream.ending) {
+            this.watchForBargeIn(stream, streamSid, ws, chunk, rms);
+            break;
+          }
 
-            // Half-duplex: while the agent is thinking or talking, drop caller
-            // audio so its own voice (echo) or an early "hello?" is not taken as an answer.
-            if (this.isAgentTurn(stream)) {
-              if (stream.audioBuffer.length) {
-                stream.audioBuffer = [];
-                stream.isSpeaking = false;
-                stream.silenceMs = 0;
-                stream.speechMs = 0;
-              }
-              break;
-            }
-
-            const chunk = Buffer.from(msg.media.payload, 'base64');
-            const rms = this.calculateUlawRMS(chunk);
-            const chunkMs = chunk.length / 8; // 8 kHz mu-law = 8 bytes per ms
-
-            const SPEECH_THRESHOLD = SPEECH_RMS_THRESHOLD;
-            const MIN_SPEECH_MS = 200;     // ignore clicks and short noise bursts
-            const END_OF_TURN_SILENCE_MS = 700;   // Responsive turn-taking (cuts dead air by 600ms)
-            const MAX_UTTERANCE_MS = 30000; // long interview answers
-
-            if (rms > SPEECH_THRESHOLD) {
-              stream.isSpeaking = true;
+          // Otherwise caller audio is dropped while the agent is busy, so its own
+          // voice (echo) or an early "hello?" is not taken as an answer.
+          if (!this.hearsCaller(stream)) {
+            if (stream.audioBuffer.length) {
+              stream.audioBuffer = [];
+              stream.isSpeaking = false;
               stream.silenceMs = 0;
-              stream.speechMs = (stream.speechMs || 0) + chunkMs;
-              stream.quietSince = Date.now();
-              stream.idleCheckedIn = false;
-            } else if (stream.isSpeaking) {
-              stream.silenceMs = (stream.silenceMs || 0) + chunkMs;
+              stream.speechMs = 0;
             }
+            break;
+          }
 
-            stream.audioBuffer.push(chunk);
+          const chunkMs = chunk.length / 8; // 8 kHz mu-law = 8 bytes per ms
 
-            if (!stream.isSpeaking) {
-              let bufferedMs = stream.audioBuffer.reduce((ms, c) => ms + c.length / 8, 0);
-              while (bufferedMs > PRE_ROLL_MS && stream.audioBuffer.length > 1) {
-                bufferedMs -= stream.audioBuffer.shift().length / 8;
-              }
-              break;
-            }
+          const SPEECH_THRESHOLD = SPEECH_RMS_THRESHOLD;
+          const MIN_SPEECH_MS = 200;     // ignore clicks and short noise bursts
+          const END_OF_TURN_SILENCE_MS = 700;   // Responsive turn-taking (cuts dead air by 600ms)
+          const MAX_UTTERANCE_MS = 30000; // long interview answers
 
-            const utteranceMs = stream.audioBuffer.reduce((ms, c) => ms + c.length / 8, 0);
-            const endOfTurn = stream.silenceMs >= END_OF_TURN_SILENCE_MS || utteranceMs >= MAX_UTTERANCE_MS;
-            if (!endOfTurn) break;
-
-            // Most of the silence that ended the turn is dropped before speech-to-text.
-            const joined = Buffer.concat(stream.audioBuffer);
-            const trailingDropMs = Math.max(0, stream.silenceMs - TRAILING_SILENCE_KEPT_MS);
-            const fullBuffer = joined.subarray(0, Math.max(0, joined.length - Math.floor(trailingDropMs * 8)));
-            const wasRealSpeech = stream.speechMs >= MIN_SPEECH_MS;
-            stream.audioBuffer = [];
-            stream.isSpeaking = false;
+          if (rms > SPEECH_THRESHOLD) {
+            stream.isSpeaking = true;
             stream.silenceMs = 0;
-            stream.speechMs = 0;
+            stream.speechMs = (stream.speechMs || 0) + chunkMs;
+            stream.quietSince = Date.now();
+            stream.idleCheckedIn = false;
+          } else if (stream.isSpeaking) {
+            stream.silenceMs = (stream.silenceMs || 0) + chunkMs;
+          }
 
-            if (wasRealSpeech) {
-              this.handleCompleteSpeech(streamSid, ws, fullBuffer).catch(err => console.error(err));
-            }
+          stream.audioBuffer.push(chunk);
+
+          if (!stream.isSpeaking) {
+            this.keepLeadIn(stream);
+            break;
+          }
+
+          const utteranceMs = stream.audioBuffer.reduce((ms, c) => ms + c.length / 8, 0);
+          const endOfTurn = stream.silenceMs >= END_OF_TURN_SILENCE_MS || utteranceMs >= MAX_UTTERANCE_MS;
+          if (!endOfTurn) break;
+
+          // Most of the silence that ended the turn is dropped before speech-to-text.
+          const joined = Buffer.concat(stream.audioBuffer);
+          const trailingDropMs = Math.max(0, stream.silenceMs - TRAILING_SILENCE_KEPT_MS);
+          const fullBuffer = joined.subarray(0, Math.max(0, joined.length - Math.floor(trailingDropMs * 8)));
+          const wasRealSpeech = stream.speechMs >= MIN_SPEECH_MS;
+          stream.audioBuffer = [];
+          stream.isSpeaking = false;
+          stream.silenceMs = 0;
+          stream.speechMs = 0;
+          stream.callerHasFloor = false;
+
+          if (wasRealSpeech) {
+            this.handleCompleteSpeech(streamSid, ws, fullBuffer).catch(err => console.error(err));
           }
           break;
+        }
 
-        case 'mark':
+        case 'mark': {
+          // Marks for audio that a 'clear' dropped come back too; that playback is already over.
+          const markStream = this.activeStreams.get(streamSid);
+          if (markStream && msg.mark?.name !== `agent-speech-${markStream.playbackGen || 0}`) break;
           await this.handlePlaybackComplete(streamSid);
           break;
+        }
 
         case 'stop':
           this.endStream(streamSid);
@@ -934,25 +1136,38 @@ class VoiceAutomationService extends EventEmitter {
     });
   }
 
-  // One caller turn at a time: the next utterance is not heard until this
-  // one has been answered and the answer has finished playing.
+  // One caller turn at a time. Words the caller finishes while a turn is still
+  // being handled are held and answered right after it.
   async handleCompleteSpeech(streamSid, ws, audioBuffer) {
     const stream = this.activeStreams.get(streamSid);
-    if (!stream || stream.processingTurn) return;
+    if (!stream) return;
+    if (stream.processingTurn) {
+      stream.heldAudio = stream.heldAudio ? Buffer.concat([stream.heldAudio, audioBuffer]) : audioBuffer;
+      return;
+    }
     stream.processingTurn = true;
+    stream.answering = true;
     const turnStartedAt = Date.now();
     try {
       await this.processCallerTurn(stream, streamSid, ws, audioBuffer);
     } finally {
       stream.processingTurn = false;
+      stream.answering = false;
       console.log(`[Timing] Caller turn handled in ${Date.now() - turnStartedAt}ms`);
     }
+    this.answerHeldWords(streamSid, ws);
   }
 
   async processCallerTurn(stream, streamSid, ws, audioBuffer) {
     if (stream.ending) return;
     const text = await this.processSTT(audioBuffer, stream.userId, stream.agentId, stream.flowId);
-    if (!text || !text.trim() || stream.ending) return;
+    if (stream.ending) return;
+    // The agent was cut off by a noise or only a "hmm": it finishes what it was saying.
+    if (!text || !text.trim() || (stream.unheard && this.isFillerOnly(text))) {
+      await this.resumeUnheard(stream, streamSid, ws, text ? text.trim() : '');
+      return;
+    }
+    stream.unheard = null;
 
     console.log(`Processing complete sentence: "${text}"`);
 
@@ -1233,7 +1448,7 @@ class VoiceAutomationService extends EventEmitter {
           // latest turns. The caller's last words are its final line.
           const conversationContext = stream.conversationHistory
             .slice(-HISTORY_TURNS_SENT)
-            .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`)
+            .map(m => `${m.role === 'user' ? 'User' : m.interrupted ? 'Assistant (cut off by the caller)' : 'Assistant'}: ${m.text}`)
             .join('\n');
 
           const fullPrompt = `Conversation so far:\n${conversationContext}\n\nReply to the user's last message.`;
@@ -1256,7 +1471,21 @@ class VoiceAutomationService extends EventEmitter {
             }
           );
           // The model sometimes labels its turn ("Assistant: ..."), which would be spoken aloud.
-          const nextResponse = (rawResponse || '').replace(/^\s*(assistant|agent|ai)\s*:\s*/i, '');
+          const nextResponse = (rawResponse || '').replace(/^\s*(assistant|agent|ai)\s*(\([^)]*\))?\s*:\s*/i, '');
+
+          // The caller said more while this reply was being written: it is not
+          // played, and their new words are answered together with these.
+          if (nextResponse && nextResponse.trim() && this.callerKeptTalking(stream)) {
+            const history = stream.conversationHistory;
+            stream.unheard = {
+              text: nextResponse,
+              voiceId: currentAgent.voice_id,
+              at: Date.now(),
+              restore: () => history.push({ role: 'assistant', text: nextResponse }),
+            };
+            console.log('[Barge-in] Caller kept talking while the agent was thinking; reply held back');
+            return;
+          }
 
           if (nextResponse && nextResponse.trim()) {
             stream.conversationHistory.push({ role: 'assistant', text: nextResponse });
@@ -1381,8 +1610,8 @@ class VoiceAutomationService extends EventEmitter {
       // The audio is made while waiting for the customer's hello, then sent.
       await this.waitForGreetingTurn(stream);
       if (!this.activeStreams.has(streamSid)) return;
-      stream.audioBuffer = [];
-      this.sendAgentAudio(ws, streamSid, base64Audio);
+      if (!stream.callerHasFloor) stream.audioBuffer = [];
+      this.sendAgentAudio(ws, streamSid, base64Audio, { text, voiceId });
     } catch (err) {
       console.error(`[${provider || 'ElevenLabs'}] TTS failed, falling back to Twilio <Say>:`, err.message);
       await this.speakViaTwiml(streamSid, text);

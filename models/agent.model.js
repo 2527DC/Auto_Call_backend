@@ -183,6 +183,18 @@ const AgentSchema = new Schema(
       min: 300,
       max: 3000
     },
+    // The caller may talk over the agent: clear speech stops it and is answered.
+    allow_interruptions: {
+      type: Boolean,
+      default: true
+    },
+    // How readily it stops: low needs longer, louder speech (noisy places),
+    // high stops at the first words.
+    interruption_sensitivity: {
+      type: String,
+      enum: ['low', 'medium', 'high'],
+      default: 'medium'
+    },
     enable_call_recording: {
       type: Boolean,
       default: false

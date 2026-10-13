@@ -193,6 +193,10 @@ exports.createAgent = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Enable call transcription must be a boolean value' });
     }
 
+    if (agentData.interruption_sensitivity && !['low', 'medium', 'high'].includes(agentData.interruption_sensitivity)) {
+      return res.status(400).json({ success: false, message: 'Interruption sensitivity must be low, medium, or high' });
+    }
+
     if (agentData.telephony_provider && !['twilio', 'sip', 'meta_whatsapp', 'plivo'].includes(agentData.telephony_provider)) {
       return res.status(400).json({ success: false, message: 'Invalid telephony provider selected.' });
     }
@@ -319,6 +323,10 @@ exports.updateAgent = async (req, res) => {
 
     if (updateData.enable_call_transcription !== undefined && typeof updateData.enable_call_transcription !== 'boolean') {
       return res.status(400).json({ success: false, message: 'Enable call transcription must be a boolean value' });
+    }
+
+    if (updateData.interruption_sensitivity && !['low', 'medium', 'high'].includes(updateData.interruption_sensitivity)) {
+      return res.status(400).json({ success: false, message: 'Interruption sensitivity must be low, medium, or high' });
     }
 
     if (updateData.telephony_provider && !['twilio', 'sip', 'meta_whatsapp', 'plivo'].includes(updateData.telephony_provider)) {

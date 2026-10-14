@@ -30,7 +30,25 @@ const ttsCache = require('./voice/ttsCache');
 const { decrypt } = require('../utils/encryption-utils');
 
 // Loudness (RMS of decoded mu-law) above which caller audio counts as speech.
-const SPEECH_RMS_THRESHOLD = 800;
+// 650 is calibrated for standard 8 kHz telephone mu-law to capture normal voice while ignoring line hum.
+const SPEECH_RMS_THRESHOLD = 650;
+
+// In-memory cache for active violence words with 5-minute TTL to eliminate DB queries on speech turns.
+let cachedViolenceWords = null;
+let cachedViolenceWordsExpiry = 0;
+async function getActiveViolenceWords() {
+  const now = Date.now();
+  if (cachedViolenceWords && now < cachedViolenceWordsExpiry) {
+    return cachedViolenceWords;
+  }
+  try {
+    cachedViolenceWords = await ViolenceWord.find({ is_active: true }).lean();
+    cachedViolenceWordsExpiry = now + 5 * 60 * 1000;
+    return cachedViolenceWords;
+  } catch (err) {
+    return cachedViolenceWords || [];
+  }
+}
 
 // Outgoing calls: people answer with "Hello?". Greeting at once talks over them
 // (and their words are dropped while the agent speaks), so by default the
@@ -65,17 +83,18 @@ const STILL_THERE = {
 };
 const DEFAULT_GOODBYE = 'Goodbye! Thank you for calling.';
 
-// The caller may talk over the agent. Speech that cuts it off must be louder
-// than ordinary speech (so a little echo of the agent's own voice or room noise
-// does not) and last a moment (so a cough or a click does not), set per agent
-// by interruption_sensitivity.
+// The caller may talk over the agent. Speech that cuts it off must be clear
+// conversational speech above telephone line hum, set per agent by interruption_sensitivity.
+// high: ~150ms of speech (instant barge-in for fast natural conversation)
+// medium: ~200ms of speech (balanced)
+// low: ~380ms of louder speech (noisy environments)
 const INTERRUPTION_RULES = {
-  low: { speechMs: 700, rms: SPEECH_RMS_THRESHOLD * 2 },
-  medium: { speechMs: 400, rms: SPEECH_RMS_THRESHOLD * 1.5 },
-  high: { speechMs: 250, rms: SPEECH_RMS_THRESHOLD },
+  low: { speechMs: 380, rms: Math.round(SPEECH_RMS_THRESHOLD * 1.4) },
+  medium: { speechMs: 200, rms: Math.round(SPEECH_RMS_THRESHOLD * 1.1) },
+  high: { speechMs: 150, rms: SPEECH_RMS_THRESHOLD },
 };
 const BARGE_IN_GAP_MS = 300;    // a longer pause starts the count again
-const BARGE_IN_GRACE_MS = 500;  // each utterance plays this long before it can be cut
+const BARGE_IN_GRACE_MS = 150;  // allow immediate caller interruption after start of playback
 // A reply cut off by what turns out to be noise, or only "hmm" or "ok", is
 // finished from the start of the cut sentence if the caller spoke this recently.
 const RESUME_WITHIN_MS = 15000;
@@ -305,7 +324,10 @@ class VoiceAutomationService extends EventEmitter {
   // How much caller speech cuts the agent off, or null when it may not be interrupted.
   interruptionRule(agent) {
     if (agent?.allow_interruptions === false) return null;
-    return INTERRUPTION_RULES[agent?.interruption_sensitivity] || INTERRUPTION_RULES.medium;
+    if (agent?.interruption_sensitivity && INTERRUPTION_RULES[agent.interruption_sensitivity]) {
+      return INTERRUPTION_RULES[agent.interruption_sensitivity];
+    }
+    return agent?.type === 'incoming' ? INTERRUPTION_RULES.high : INTERRUPTION_RULES.medium;
   }
 
   // Whether caller audio counts towards their next turn (while the agent
@@ -393,6 +415,12 @@ class VoiceAutomationService extends EventEmitter {
   // only the part the caller heard, and the rest is kept in case the caller
   // turns out to have said nothing (see resumeUnheard).
   interruptAgent(stream, streamSid, ws, now = Date.now()) {
+    if (stream.turnAbort) {
+      try {
+        stream.turnAbort.abort();
+      } catch (_) {}
+      stream.turnAbort = null;
+    }
     ws.send(JSON.stringify(stream.provider === 'plivo'
       ? { event: 'clearAudio', streamId: streamSid }
       : { event: 'clear', streamSid }));
@@ -578,8 +606,8 @@ class VoiceAutomationService extends EventEmitter {
         console.warn('[TTS] No Deepgram API key found. Falling back to Twilio <Say>.');
         return null;
       }
-      const pcmBuffer = await deepgramService.generateSpeech(text, voiceId || 'aura-asteria-en', {}, dgApiKey, 8000);
-      return this.encodePcmToUlaw(pcmBuffer, 8000).toString('base64');
+      const mulawBuffer = await deepgramService.generateSpeech(text, voiceId || 'aura-asteria-en', {}, dgApiKey, 8000, 'mulaw');
+      return mulawBuffer.toString('base64');
     }
 
     if (provider === 'sarvam_ai') {
@@ -886,6 +914,12 @@ class VoiceAutomationService extends EventEmitter {
             if (startStream) {
               startStream.agent = hasFlow ? flowAgent : directAgent;
               startStream.userSettings = userSettings;
+              startStream.aiConfig = userSettings?.ai_model ? {
+                model: userSettings.ai_model.model_id,
+                apiKey: userSettings.ai_api_key,
+                provider: userSettings.ai_model.provider
+              } : null;
+              startStream.callLog = callLog;
               // The answer URL says which way the call goes; the call log is the fallback.
               startStream.greetingWaitMs = this.greetingWaitFor(startStream.agent, customData.direction || callLog?.direction);
             }
@@ -1104,8 +1138,8 @@ class VoiceAutomationService extends EventEmitter {
           const chunkMs = chunk.length / 8; // 8 kHz mu-law = 8 bytes per ms
 
           const SPEECH_THRESHOLD = SPEECH_RMS_THRESHOLD;
-          const MIN_SPEECH_MS = 200;     // ignore clicks and short noise bursts
-          const END_OF_TURN_SILENCE_MS = 700;   // Responsive turn-taking (cuts dead air by 600ms)
+          const MIN_SPEECH_MS = 150;     // ignore clicks and short noise bursts
+          const END_OF_TURN_SILENCE_MS = 380;   // Snappy turn-taking: 380ms of silence marks end of turn (cuts dead air by 320ms)
           const MAX_UTTERANCE_MS = 30000; // long interview answers
 
           if (rms > SPEECH_THRESHOLD) {
@@ -1207,7 +1241,7 @@ class VoiceAutomationService extends EventEmitter {
 
   async processCallerTurn(stream, streamSid, ws, audioBuffer, { exitsOnly = false } = {}) {
     if (stream.ending) return;
-    const text = await this.processSTT(audioBuffer, stream.userId, stream.agentId, stream.flowId);
+    const text = await this.processSTT(audioBuffer, stream.userId, stream.agentId, stream.flowId, stream);
     if (stream.ending) return;
     // The agent was cut off by a noise or only a "hmm": it finishes what it was saying.
     if (!text || !text.trim() || (stream.unheard && this.isFillerOnly(text))) {
@@ -1220,14 +1254,17 @@ class VoiceAutomationService extends EventEmitter {
 
     console.log(`Processing complete sentence: "${text}"${exitsOnly ? ' (said while the agent was busy)' : ''}`);
 
-    let currentAgentForChecks = null;
-    if (stream.agentId) {
-      currentAgentForChecks = await Agent.findById(stream.agentId);
-    } else if (stream.flowId) {
-      currentAgentForChecks = await Agent.findOne({ flow_id: stream.flowId });
+    let currentAgentForChecks = stream.agent || null;
+    if (!currentAgentForChecks) {
+      if (stream.agentId) {
+        currentAgentForChecks = await Agent.findById(stream.agentId).populate('llm_model', 'model_id provider name');
+      } else if (stream.flowId) {
+        currentAgentForChecks = await Agent.findOne({ flow_id: stream.flowId }).populate('llm_model', 'model_id provider name');
+      }
+      if (currentAgentForChecks) stream.agent = currentAgentForChecks;
     }
 
-    let earlyUserSettings = null;
+    let earlyUserSettings = stream.userSettings || null;
 
     if (currentAgentForChecks) {
       if (currentAgentForChecks.max_call_duration && stream.callStartTime) {
@@ -1283,7 +1320,7 @@ class VoiceAutomationService extends EventEmitter {
               }
 
               try {
-                const callLog = await Call.findOne({ twilio_call_sid: stream.callSid });
+                const callLog = stream.callLog || await Call.findOne({ twilio_call_sid: stream.callSid });
                 if (callLog) {
                   callLog.is_transferred = true;
                   if (currentAgentForChecks.transfer_to_human.member_id) {
@@ -1294,7 +1331,7 @@ class VoiceAutomationService extends EventEmitter {
                     transferred_at: new Date(),
                     human_call_status: 'initiated'
                   };
-                  await callLog.save();
+                  Call.updateOne({ _id: callLog._id }, { $set: { is_transferred: true, transfer_member_id: callLog.transfer_member_id, transfer_details: callLog.transfer_details } }).catch(() => {});
                 }
               } catch (e) {
                 console.error('Error saving transfer data to call log:', e.message);
@@ -1314,20 +1351,21 @@ class VoiceAutomationService extends EventEmitter {
     }
 
     try {
-      const currentCallLog = await Call.findOne({ twilio_call_sid: stream.callSid });
-      const userSettings = await UserSettings.findOne({ user: stream.userId }).populate('ai_model');
-      const aiConfig = userSettings?.ai_model ? {
+      const currentCallLog = stream.callLog || await Call.findOne({ twilio_call_sid: stream.callSid });
+      const userSettings = stream.userSettings || (stream.userId ? await UserSettings.findOne({ user: stream.userId }).populate('ai_model') : null);
+      const aiConfig = stream.aiConfig || (userSettings?.ai_model ? {
         model: userSettings.ai_model.model_id,
         apiKey: userSettings.ai_api_key,
         provider: userSettings.ai_model.provider
-      } : null;
+      } : null);
 
       if (!currentCallLog) return;
       
-      const violenceWords = await ViolenceWord.find({ is_active: true });
+      const violenceWords = await getActiveViolenceWords();
+      let detectedWords = [];
       if (violenceWords.length > 0) {
         const textLower = text.toLowerCase();
-        const detectedWords = violenceWords
+        detectedWords = violenceWords
           .filter(vw => textLower.includes(vw.word.toLowerCase()))
           .map(vw => vw.word);
           
@@ -1338,7 +1376,6 @@ class VoiceAutomationService extends EventEmitter {
           } else {
             currentCallLog.transcript_snippet = text;
           }
-          await currentCallLog.save();
         }
       }
 
@@ -1351,22 +1388,20 @@ class VoiceAutomationService extends EventEmitter {
         }
       }
 
-      if (stream.agentId) {
-        const agent = await Agent.findById(stream.agentId);
-        if (agent?.enable_call_transcription !== false) {
-          if (currentAgentForChecks?.enable_call_transcription) {
-            currentCallLog.transcript.push({ role: 'user', text: text });
-          }
-        }
-      } else if (stream.flowId) {
-        const agent = await Agent.findOne({ flow_id: stream.flowId });
-        if (!agent || agent?.enable_call_transcription !== false) {
-          if (agent?.enable_call_transcription) {
-            currentCallLog.transcript.push({ role: 'user', text: text });
-          }
-        }
+      if (currentAgentForChecks?.enable_call_transcription !== false) {
+        currentCallLog.transcript.push({ role: 'user', text: text });
       }
-      await currentCallLog.save();
+
+      // Save user transcript asynchronously without blocking the AI speech loop
+      Call.updateOne(
+        { _id: currentCallLog._id },
+        {
+          $set: {
+            transcript: currentCallLog.transcript,
+            ...(detectedWords.length ? { detected_words: currentCallLog.detected_words, transcript_snippet: currentCallLog.transcript_snippet } : {})
+          }
+        }
+      ).catch(err => console.error('[CallLog] Background transcript save error:', err.message));
 
       if (stream.flowId) {
         const currentFlow = await Flow.findById(stream.flowId);
@@ -1502,7 +1537,7 @@ class VoiceAutomationService extends EventEmitter {
           await currentCallLog.save();
         }
       } else if (stream.agentId) {
-        const currentAgent = await Agent.findById(stream.agentId).populate('llm_model', 'model_id provider name');
+        const currentAgent = stream.agent || currentAgentForChecks || (stream.agentId ? await Agent.findById(stream.agentId).populate('llm_model', 'model_id provider name') : null);
 
         if (currentAgent) {
           if (!stream.conversationHistory) stream.conversationHistory = [];
@@ -1523,47 +1558,108 @@ class VoiceAutomationService extends EventEmitter {
           }
           systemPrompt += `\n\n${CALL_HANDLING_RULES}`;
 
-          const rawResponse = await llmService.generateResponseWithSystemPrompt(
-            fullPrompt,
+          const turnAbort = new AbortController();
+          stream.turnAbort = turnAbort;
+
+          let fullResponseText = '';
+          let endsCall = false;
+          let firstSentenceDispatched = false;
+
+          // Sequential sentence playback queue: ensures sentence 2 starts synthesizing
+          // while sentence 1 is playing, but audio chunks are sent to Plivo in correct order
+          let speakPromiseChain = Promise.resolve();
+
+          const handleSentence = async (sentence) => {
+            if (turnAbort.signal.aborted || stream.ending) return;
+            let cleanSentence = (sentence || '').replace(/^\s*(assistant|agent|ai)\s*(\([^)]*\))?\s*:\s*/i, '').trim();
+            if (cleanSentence.includes(END_CALL_MARK)) {
+              endsCall = true;
+              cleanSentence = cleanSentence.split(END_CALL_MARK).join(' ').replace(/\s+/g, ' ').trim();
+            }
+            if (!cleanSentence) return;
+
+            // If caller began speaking while sentence was generating: hold back!
+            if (this.callerKeptTalking(stream)) {
+              console.log('[Barge-in] Caller kept talking while reply was generating; reply held back');
+              turnAbort.abort();
+              stream.unheard = {
+                text: cleanSentence,
+                voiceId: currentAgent.voice_id,
+                at: Date.now(),
+                restore: () => stream.conversationHistory.push({ role: 'assistant', text: cleanSentence }),
+              };
+              return;
+            }
+
+            fullResponseText += (fullResponseText ? ' ' : '') + cleanSentence;
+            firstSentenceDispatched = true;
+
+            // Chain speak promises sequentially so utterances queue smoothly
+            speakPromiseChain = speakPromiseChain.then(async () => {
+              if (turnAbort.signal.aborted || stream.ending) return;
+              if (endsCall) {
+                await this.endCallWithGoodbye(streamSid, ws, 'agent said goodbye', cleanSentence);
+              } else {
+                await this.speak(ws, streamSid, cleanSentence, currentAgent.voice_id, userSettings?.elevenlabs_api_key);
+              }
+            }).catch(err => console.error('[Voice] Speak chunk error:', err.message));
+          };
+
+          const rawResponse = await llmService.streamResponseWithSystemPrompt({
+            prompt: fullPrompt,
             systemPrompt,
-            aiConfig?.model || currentAgent.llm_model?.model_id,
+            model: aiConfig?.model || currentAgent.llm_model?.model_id,
             aiConfig,
-            {
+            agentConfig: {
               empathy_level: currentAgent.empathy_level,
               energy_level: currentAgent.energy_level,
               response_length: currentAgent.response_length,
               intelligence_level: currentAgent.intelligence_level
-            }
-          );
-          // The model sometimes labels its turn ("Assistant: ..."), which would be spoken aloud.
-          const labelled = (rawResponse || '').replace(/^\s*(assistant|agent|ai)\s*(\([^)]*\))?\s*:\s*/i, '');
-          const endsCall = labelled.includes(END_CALL_MARK);
-          const nextResponse = labelled.split(END_CALL_MARK).join(' ').replace(/\s+/g, ' ').trim();
+            },
+            onSentence: handleSentence,
+            signal: turnAbort.signal
+          });
 
-          // The caller said more while this reply was being written: it is not
-          // played, and their new words are answered together with these.
-          if (nextResponse && nextResponse.trim() && this.callerKeptTalking(stream)) {
-            const history = stream.conversationHistory;
-            stream.unheard = {
-              text: nextResponse,
-              voiceId: currentAgent.voice_id,
-              at: Date.now(),
-              restore: () => history.push({ role: 'assistant', text: nextResponse }),
-            };
-            console.log('[Barge-in] Caller kept talking while the agent was thinking; reply held back');
-            return;
+          // Wait for any remaining chained speak promises to complete synthesis
+          await speakPromiseChain;
+
+          // If streaming didn't dispatch (e.g. non-streaming fallback returned full text)
+          if (!firstSentenceDispatched && rawResponse && rawResponse.trim() && !turnAbort.signal.aborted) {
+            let labelled = rawResponse.replace(/^\s*(assistant|agent|ai)\s*(\([^)]*\))?\s*:\s*/i, '');
+            if (labelled.includes(END_CALL_MARK)) {
+              endsCall = true;
+              labelled = labelled.split(END_CALL_MARK).join(' ').replace(/\s+/g, ' ').trim();
+            }
+            const nextResponse = labelled.trim();
+            if (nextResponse) {
+              if (this.callerKeptTalking(stream)) {
+                stream.unheard = {
+                  text: nextResponse,
+                  voiceId: currentAgent.voice_id,
+                  at: Date.now(),
+                  restore: () => stream.conversationHistory.push({ role: 'assistant', text: nextResponse }),
+                };
+              } else {
+                fullResponseText = nextResponse;
+                if (endsCall) {
+                  await this.endCallWithGoodbye(streamSid, ws, 'agent said goodbye', nextResponse);
+                } else {
+                  await this.speak(ws, streamSid, nextResponse, currentAgent.voice_id, userSettings?.elevenlabs_api_key);
+                }
+              }
+            }
           }
 
-          if (nextResponse && nextResponse.trim()) {
-            stream.conversationHistory.push({ role: 'assistant', text: nextResponse });
-            if (endsCall) await this.endCallWithGoodbye(streamSid, ws, 'agent said goodbye', nextResponse);
-            else await this.speak(ws, streamSid, nextResponse, currentAgent.voice_id, userSettings?.elevenlabs_api_key);
-
+          if (fullResponseText && !turnAbort.signal.aborted) {
+            stream.conversationHistory.push({ role: 'assistant', text: fullResponseText });
             if (currentAgent.enable_call_transcription !== false) {
               if (currentAgent?.enable_call_transcription) {
-                currentCallLog.transcript.push({ role: 'agent', text: nextResponse });
+                currentCallLog.transcript.push({ role: 'agent', text: fullResponseText });
               }
-              await currentCallLog.save();
+              Call.updateOne(
+                { _id: currentCallLog._id },
+                { $set: { transcript: currentCallLog.transcript } }
+              ).catch(err => console.error('[CallLog] Background transcript update error:', err.message));
             }
           }
         }
@@ -1573,13 +1669,18 @@ class VoiceAutomationService extends EventEmitter {
     }
   }
 
-  async processSTT(buffer, userId, agentId = null, flowId = null) {
+  async processSTT(buffer, userId, agentId = null, flowId = null, stream = null) {
     try {
       const validUserId = (userId && userId !== 'undefined' && userId !== 'null' && db.mongoose.Types.ObjectId.isValid(userId)) ? userId : null;
-      const userSettings = validUserId ? await UserSettings.findOne({ user: validUserId }) : null;
-      let agent = null;
-      if (agentId && agentId !== 'undefined' && agentId !== 'null' && db.mongoose.Types.ObjectId.isValid(agentId)) agent = await Agent.findById(agentId);
-      else if (flowId && flowId !== 'undefined' && flowId !== 'null' && db.mongoose.Types.ObjectId.isValid(flowId)) agent = await Agent.findOne({ flow_id: flowId });
+      const userSettings = stream?.userSettings || (validUserId ? await UserSettings.findOne({ user: validUserId }) : null);
+      let agent = stream?.agent || null;
+      if (!agent) {
+        if (agentId && agentId !== 'undefined' && agentId !== 'null' && db.mongoose.Types.ObjectId.isValid(agentId)) {
+          agent = await Agent.findById(agentId);
+        } else if (flowId && flowId !== 'undefined' && flowId !== 'null' && db.mongoose.Types.ObjectId.isValid(flowId)) {
+          agent = await Agent.findOne({ flow_id: flowId });
+        }
+      }
 
       const provider = agent?.voice_provider || (agent?.telephony_provider?.startsWith('deepgram') ? 'deepgram' : (agent?.telephony_provider?.startsWith('sarvam_ai') ? 'sarvam_ai' : 'elevenlabs'));
       recordUsage({ stt_provider: provider, stt_seconds: buffer.length / 8000 });

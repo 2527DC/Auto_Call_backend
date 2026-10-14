@@ -1,4 +1,5 @@
 const { recordLlmResponse } = require('../utils/usageMeter');
+const OpenAI = require('openai');
 
 // Every AI provider reports token counts in its response; record them against
 // the call being handled, for the cost and profit report.
@@ -19,6 +20,27 @@ const REPLY_LENGTH = {
 const PHONE_RULES = 'This is a phone call: speak naturally, as a person would. No lists, markdown or emojis.';
 // Retired models (gemini-1.5-flash) no longer answer, so a rate-limited live call retries on this.
 const GEMINI_FALLBACK_MODEL = 'gemini-2.5-flash-lite';
+
+// Extracts a complete sentence candidate from a streaming token buffer.
+const extractCompleteSentence = (buffer) => {
+  const abbrevRegex = /\b(mr|mrs|ms|dr|prof|sr|jr|vs|etc|eg|ie|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\.\s*$/i;
+  const sentenceEndRegex = /([.!?।॥])\s+/g;
+  let match;
+
+  while ((match = sentenceEndRegex.exec(buffer)) !== null) {
+    const splitIndex = match.index + match[1].length;
+    const sentenceCandidate = buffer.slice(0, splitIndex).trim();
+
+    if (abbrevRegex.test(sentenceCandidate)) {
+      continue; // Skip abbreviation and keep searching for next sentence end
+    }
+    if (sentenceCandidate.length < 2) continue;
+
+    const remaining = buffer.slice(splitIndex).trimStart();
+    return { sentence: sentenceCandidate, remaining };
+  }
+  return null;
+};
 
 // Gemini 2.5 Flash thinks before answering unless told not to, and thinking is
 // billed as output. A phone reply doesn't need it. Gemini 3 models reject this
@@ -179,6 +201,118 @@ class LLMService {
     } catch (error) {
       console.error('LLM System Prompt Error:', error.response?.data || error.message);
       return "I'm sorry, I encountered an error while processing your request.";
+    }
+  }
+
+  async streamResponseWithSystemPrompt({ prompt, systemPrompt, model = 'gemini-2.5-flash', aiConfig = null, agentConfig = null, onSentence, signal = null }) {
+    try {
+      const noiseTokens = ['[background noise]', '[pause]', '[laughs]', '[clicking]', '[silence]', '[phone hangs up]', '[phone clicking]', '[click]'];
+      let cleanPrompt = prompt;
+      noiseTokens.forEach(token => {
+        const escapedToken = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        cleanPrompt = cleanPrompt.replace(new RegExp(escapedToken, 'gi'), '');
+      });
+      cleanPrompt = cleanPrompt.trim();
+
+      if (!cleanPrompt || cleanPrompt.length < 2) return '';
+
+      if (!aiConfig || !aiConfig.provider || !aiConfig.apiKey || !aiConfig.model) {
+        console.error('Missing dynamic AI configuration for streaming agent.');
+        return "I'm sorry, the AI model is not properly configured.";
+      }
+
+      const provider = String(aiConfig.provider || '').toLowerCase();
+      const apiKey = aiConfig.apiKey;
+      const resolvedModel = aiConfig.model;
+
+      let enhancedSystemPrompt = systemPrompt || 'You are a helpful and professional AI assistant on a phone call. Keep answers concise.';
+
+      if (agentConfig) {
+        const traits = [];
+        if (agentConfig.empathy_level) {
+          traits.push(`Empathy Level: ${agentConfig.empathy_level === 'high' ? 'Show high empathy and understanding' : agentConfig.empathy_level === 'low' ? 'Keep responses factual and direct' : 'Show moderate empathy'}`);
+        }
+        if (agentConfig.energy_level) {
+          traits.push(`Energy Level: ${agentConfig.energy_level === 'energetic' ? 'Be enthusiastic and energetic' : agentConfig.energy_level === 'calm' ? 'Maintain a calm and soothing tone' : 'Keep a balanced, professional tone'}`);
+        }
+        if (agentConfig.intelligence_level !== undefined) {
+          const intelLevel = agentConfig.intelligence_level;
+          traits.push(`Intelligence Level: ${intelLevel}/10 - ${intelLevel >= 8 ? 'Provide sophisticated, nuanced responses' : intelLevel >= 5 ? 'Provide clear, straightforward responses' : 'Keep responses simple and basic'}`);
+        }
+        if (traits.length > 0) {
+          enhancedSystemPrompt += '\n\nPERSONALITY TRAITS:\n' + traits.join('\n');
+        }
+      }
+
+      const length = REPLY_LENGTH[agentConfig?.response_length] || REPLY_LENGTH.balanced;
+      enhancedSystemPrompt += `\n\nREPLY RULES:\n${length.rule} ${PHONE_RULES}`;
+
+      if (provider === 'openai') {
+        const openai = new OpenAI({ apiKey });
+        const stream = await openai.chat.completions.create({
+          model: resolvedModel || 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: enhancedSystemPrompt },
+            { role: 'user', content: cleanPrompt }
+          ],
+          temperature: 0.7,
+          max_tokens: length.maxTokens,
+          stream: true,
+          stream_options: { include_usage: true }
+        }, { signal });
+
+        let sentenceBuffer = '';
+        let fullGeneratedText = '';
+
+        for await (const chunk of stream) {
+          if (signal?.aborted) break;
+
+          if (chunk.usage) {
+            recordLlmResponse(chunk);
+          }
+
+          const delta = chunk.choices[0]?.delta?.content || '';
+          if (!delta) continue;
+
+          sentenceBuffer += delta;
+          fullGeneratedText += delta;
+
+          // Check for complete sentence in buffer
+          let extracted;
+          while ((extracted = extractCompleteSentence(sentenceBuffer))) {
+            const sentenceToEmit = extracted.sentence.trim();
+            sentenceBuffer = extracted.remaining;
+            if (sentenceToEmit && onSentence && !signal?.aborted) {
+              await onSentence(sentenceToEmit);
+            }
+          }
+        }
+
+        // Flush remaining buffer at end of stream
+        if (sentenceBuffer.trim() && onSentence && !signal?.aborted) {
+          await onSentence(sentenceBuffer.trim());
+        }
+
+        return fullGeneratedText.trim();
+      }
+
+      // For non-streaming providers (Gemini, Anthropic): fall back to generateResponseWithSystemPrompt
+      const response = await this.generateResponseWithSystemPrompt(prompt, systemPrompt, model, aiConfig, agentConfig);
+      if (response && onSentence && !signal?.aborted) {
+        await onSentence(response);
+      }
+      return response;
+    } catch (error) {
+      if (signal?.aborted || error.name === 'AbortError' || error.message?.includes('aborted')) {
+        console.log('[LLM Stream] Generation aborted by caller interruption');
+        return '';
+      }
+      console.error('LLM Streaming Error:', error.response?.data || error.message);
+      const fallbackResponse = await this.generateResponseWithSystemPrompt(prompt, systemPrompt, model, aiConfig, agentConfig);
+      if (fallbackResponse && onSentence && !signal?.aborted) {
+        await onSentence(fallbackResponse);
+      }
+      return fallbackResponse;
     }
   }
 

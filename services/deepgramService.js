@@ -8,7 +8,7 @@ class DeepgramService {
     this.baseUrl = 'https://api.deepgram.com/v1';
   }
 
-  async generateSpeech(text, voiceId = 'aura-asteria-en', voiceSettings = {}, apiKey = null, sampleRate = 16000) {
+  async generateSpeech(text, voiceId = 'aura-asteria-en', voiceSettings = {}, apiKey = null, sampleRate = 16000, encoding = 'linear16') {
     const activeApiKey = apiKey || this.apiKey;
     if (!activeApiKey) {
       throw new Error('Deepgram API Key not configured');
@@ -17,9 +17,10 @@ class DeepgramService {
     try {
       const model = voiceId || 'aura-asteria-en';
       const sr = sampleRate || 16000;
+      const enc = encoding || 'linear16';
       const response = await axios({
         method: 'POST',
-        url: `${this.baseUrl}/speak?model=${model}&encoding=linear16&sample_rate=${sr}`,
+        url: `${this.baseUrl}/speak?model=${model}&encoding=${enc}&sample_rate=${sr}`,
         data: { text },
         headers: {
           'Authorization': `Token ${activeApiKey}`,
@@ -30,9 +31,15 @@ class DeepgramService {
 
       const audioBuffer = Buffer.from(response.data);
 
-      this.saveAudio(this.wrapPcmInWav(audioBuffer, sr), `deepgram_tts_${Date.now()}.wav`).catch(err => {
-        console.error('Error saving debug audio:', err.message);
-      });
+      if (enc === 'linear16') {
+        this.saveAudio(this.wrapPcmInWav(audioBuffer, sr), `deepgram_tts_${Date.now()}.wav`).catch(err => {
+          console.error('Error saving debug audio:', err.message);
+        });
+      } else {
+        this.saveAudio(audioBuffer, `deepgram_tts_${Date.now()}.ulaw`).catch(err => {
+          console.error('Error saving debug audio:', err.message);
+        });
+      }
 
       return audioBuffer;
     } catch (error) {

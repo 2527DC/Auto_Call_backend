@@ -12,8 +12,13 @@ const deepgramService = require('./deepgramService');
 const sarvamService = require('./sarvamService');
 const automationEngine = require('../utils/automationEngine');
 const llmService = require('./llmService');
+const webhookDispatcher = require('./webhookDispatcher');
+const { findContactByPhone, findOrCreateContact } = require('../utils/phone');
 
 const aiProcessingLocks = new Map();
+
+// Answer time, so the duration doesn't include ringing.
+const answered = (callLog) => { if (!callLog.answered_at) callLog.answered_at = new Date(); };
 
 class WhatsappCallAutomationService {
     async handleCallWebhook(callData, phoneNumberId) {
@@ -32,7 +37,7 @@ class WhatsappCallAutomationService {
                             return;
                         }
 
-                        const { contact, agent } = await this.resolveContactAndAgent(contactNumber, phoneNumberId);
+                        const { contact, agent } = await this.resolveContactAndAgent(contactNumber, phoneNumberId, { createContact: true });
 
                         if (!agent) {
                             console.error(`No agent found for call ${waCallId}`);
@@ -50,7 +55,8 @@ class WhatsappCallAutomationService {
                                 to_number: phoneNumberId,
                                 status: 'ringing',
                                 direction: 'inbound',
-                                lead_name: contact?.name || contact?.first_name || 'Unknown'
+                                contact_id: contact?._id || null,
+                                lead_name: [contact?.first_name, contact?.last_name].filter(Boolean).join(' ') || 'Unknown'
                             });
                         }
 
@@ -58,6 +64,7 @@ class WhatsappCallAutomationService {
                         await whatsappCallingService.answerCall(phoneNumberId, waCallId, session.sdp, agent, contact, callLog);
 
                         callLog.status = 'in-progress';
+                        answered(callLog);
                         await callLog.save();
 
                         const userSettings = await UserSettings.findOne({ user: agent.user_id });
@@ -72,12 +79,11 @@ class WhatsappCallAutomationService {
 
                                 callLog.extracted_data = {
                                     ...(callLog.extracted_data || {}),
-                                    currentNodeId: result.currentNodeId,
-                                    appointment_details: result.final_data?.appointment_details || {},
-                                    form_responses: result.final_data?.form_responses || {},
-                                    current_field_index: result.final_data?.current_field_index || 0,
-                                    form_id: result.final_data?.form_id || null
+                                    ...automationEngine.savedFlowData(result.final_data),
+                                    currentNodeId: result.currentNodeId
                                 };
+                                if (result.callState) callLog.conversation_state = result.callState;
+                                if (result.signals?.length) callLog.live_signals.push(...result.signals);
                                 await callLog.save();
 
                                 const messages = result.logs.filter(l => l.output && l.output.last_message).map(l => l.output.last_message);
@@ -107,6 +113,7 @@ class WhatsappCallAutomationService {
                         await webrtcService.connectOutboundCall(activeCallId, session.sdp, agent, contact, callLog);
                         if (callLog) {
                             callLog.status = 'in-progress';
+                            answered(callLog);
                             await callLog.save();
 
                             const userSettings = await UserSettings.findOne({ user: agent.user_id });
@@ -121,12 +128,11 @@ class WhatsappCallAutomationService {
 
                                     callLog.extracted_data = {
                                         ...(callLog.extracted_data || {}),
-                                        currentNodeId: result.currentNodeId,
-                                        appointment_details: result.final_data?.appointment_details || {},
-                                        form_responses: result.final_data?.form_responses || {},
-                                        current_field_index: result.final_data?.current_field_index || 0,
-                                        form_id: result.final_data?.form_id || null
+                                        ...automationEngine.savedFlowData(result.final_data),
+                                        currentNodeId: result.currentNodeId
                                     };
+                                    if (result.callState) callLog.conversation_state = result.callState;
+                                    if (result.signals?.length) callLog.live_signals.push(...result.signals);
                                     await callLog.save();
 
                                     const messages = result.logs.filter(l => l.output && l.output.last_message).map(l => l.output.last_message);
@@ -165,9 +171,7 @@ class WhatsappCallAutomationService {
                         } catch (err) {
                             console.error('[CallAutomation] Error cleaning up WebRTC on terminate:', err.message);
                         }
-                        callLog.status = 'completed';
-                        callLog.ended_at = new Date();
-                        await callLog.save();
+                        await this.finishCall(callLog);
                     }
                     break;
             }
@@ -176,24 +180,33 @@ class WhatsappCallAutomationService {
         }
     }
 
-    async resolveContactAndAgent(contactNumber, phoneNumberId) {
-        let contact = await Contact.findOne({ phone_number: contactNumber });
-        let agent = null;
-
-        if (contact && contact.assigned_call_agent_id) {
-            agent = await Agent.findById(contact.assigned_call_agent_id);
-        }
-
-        if (!agent) {
-            const phone = await WhatsappPhoneNumber.findOne({ whatsapp_phone_number_id: phoneNumberId });
-            if (phone) {
-                agent = await Agent.findOne({ user_id: phone.user_id, telephony_provider: 'meta_whatsapp', status: 'active' });
-                if (!contact) {
-                    contact = await Contact.findOne({ phone_number: contactNumber, user_id: phone.user_id });
-                }
-            }
-        }
+    // createContact: only for incoming calls, where the number is the caller's.
+    async resolveContactAndAgent(contactNumber, phoneNumberId, { createContact = false } = {}) {
+        const phone = await WhatsappPhoneNumber.findOne({ whatsapp_phone_number_id: phoneNumberId });
+        if (!phone) return { contact: null, agent: null };
+        const agent = await Agent.findOne({ user_id: phone.user_id, telephony_provider: 'meta_whatsapp', status: 'active' });
+        const lookup = createContact
+            ? findOrCreateContact(Contact, phone.user_id, contactNumber, { source: 'whatsapp_call' })
+            : findContactByPhone(Contact, phone.user_id, contactNumber);
+        const contact = await lookup.catch(err => { console.error('[CallAutomation] Contact lookup failed:', err.message); return null; });
         return { contact, agent };
+    }
+
+    // The call is over: duration, webhook and the same after-call steps as phone
+    // calls (form response, appointment, follow-up message). Not charged while
+    // WhatsApp calling is in beta. Safe to call twice (hang-up webhook + end step).
+    async finishCall(callLog) {
+        const fresh = await Call.findById(callLog._id);
+        if (!fresh || fresh.status === 'completed') return;
+        const endedAt = new Date();
+        const from = fresh.answered_at || fresh.started_at;
+        fresh.status = 'completed';
+        fresh.ended_at = endedAt;
+        fresh.duration = from ? Math.max(1, Math.round((endedAt - new Date(from)) / 1000)) : 0;
+        await fresh.save();
+        webhookDispatcher.dispatchEvent(fresh.user_id, fresh.direction === 'inbound' ? 'Inbound Call Finished' : 'Call Finished', fresh);
+        require('./voiceAutomationService').handlePostCallIntegrations(fresh.twilio_call_sid, fresh.user_id)
+            .catch(err => console.error('[CallAutomation] Post-call step failed:', err.message));
     }
 
     async generateSpeech(agent, userSettings, text) {
@@ -315,17 +328,18 @@ class WhatsappCallAutomationService {
                         appointment_details: callLog.extracted_data?.appointment_details || {},
                         form_responses: callLog.extracted_data?.form_responses || {},
                         current_field_index: callLog.extracted_data?.current_field_index || 0,
-                        form_id: callLog.extracted_data?.form_id || null
+                        form_id: callLog.extracted_data?.form_id || null,
+                        call_state: callLog.conversation_state || {},
+                        can_transfer: false
                     }, callLog.extracted_data?.currentNodeId || null);
 
                     callLog.extracted_data = {
                         ...(callLog.extracted_data || {}),
-                        currentNodeId: result.currentNodeId,
-                        appointment_details: result.final_data?.appointment_details || {},
-                        form_responses: result.final_data?.form_responses || {},
-                        current_field_index: result.final_data?.current_field_index || 0,
-                        form_id: result.final_data?.form_id || null
+                        ...automationEngine.savedFlowData(result.final_data),
+                        currentNodeId: result.currentNodeId
                     };
+                    if (result.callState) callLog.conversation_state = result.callState;
+                    if (result.signals?.length) callLog.live_signals.push(...result.signals);
                     await callLog.save();
 
                     const messages = result.logs.filter(l => l.output && l.output.last_message).map(l => l.output.last_message);
@@ -360,9 +374,7 @@ class WhatsappCallAutomationService {
                             } catch (e) {
                                 console.error('[CallAutomation] Error terminating call:', e.message);
                             } finally {
-                                callLog.status = 'completed';
-                                callLog.ended_at = new Date();
-                                await callLog.save();
+                                await this.finishCall(callLog);
                             }
                         }, waitMs);
                     }

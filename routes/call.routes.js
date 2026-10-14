@@ -20,6 +20,7 @@ router.use(authenticate);
 
 router.post('/place', checkPermission('create.calls'), callController.placeCall);
 router.get('/logs', checkPermission('activity.calls'), callController.getCallLogs);
+router.get('/logs/export', checkPermission('activity.calls'), callController.exportCallLogs);
 router.get('/:id/recording', checkPermission('view.calls'), callController.getCallRecording);
 
 

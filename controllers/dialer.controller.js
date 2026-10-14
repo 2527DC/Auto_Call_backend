@@ -10,6 +10,7 @@ const User = db.User;
 const Campaign = db.Campaign;
 const SMSCampaign = db.SMSCampaign;
 const creditService = require('../services/creditService');
+const { findContactByPhone } = require('../utils/phone');
 
 exports.generateToken = async (req, res) => {
   try {
@@ -176,13 +177,15 @@ exports.handleOutboundWebhook = async (req, res) => {
 
       const callSid = req.body.CallSid || req.body.CallUUID || `webdialer_${Date.now()}`;
       try {
+        const contact = await findContactByPhone(db.Contact, userId, To);
         await Call.create({
           user_id: userId,
           twilio_call_sid: callSid,
           from_number: callerId || From,
           to_number: To,
           status: 'initiated',
-          direction: 'outbound'
+          direction: 'outbound',
+          contact_id: contact ? contact._id : null
         });
       } catch (err) {
         console.error('Failed to create call log:', err.message);

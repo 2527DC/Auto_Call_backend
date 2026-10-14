@@ -4,9 +4,10 @@ const { db } = require('../models');
 const Call = db.Call;
 const UserSettings = db.UserSettings;
 const Agent = db.Agent;
-const CampaignHistory = db.CampaignHistory;
 const PhoneNumber = db.PhoneNumber;
 const Contact = db.Contact;
+const { findContactByPhone, findOrCreateContact } = require('../utils/phone');
+const outcomeService = require('../services/outcomeService');
 const twilioService = require('../services/twilioService');
 const creditService = require('../services/creditService');
 const axios = require('axios');
@@ -208,25 +209,8 @@ exports.handleStatusCallback = async (req, res) => {
       }
     }
 
-    if (call && call.campaign_id && isEnded) {
-      let executionStatus = 'PENDING';
-      if (CallStatus === 'completed') executionStatus = 'CONTACT SUCCESSFUL';
-      else if (CallStatus === 'failed' || CallStatus === 'no-answer') executionStatus = 'CALL FAILED';
-      else if (CallStatus === 'busy') executionStatus = 'LINE BUSY';
-      else if (CallStatus === 'canceled') executionStatus = 'CANCELED';
-
-      if (CampaignHistory) {
-        await CampaignHistory.findOneAndUpdate(
-          { campaignId: call.campaign_id, leadPhone: call.to_number },
-          {
-            callStatus: executionStatus,
-            callDuration: call.duration || 0,
-            recordingUrl: call.recording_url || null
-          },
-          { new: true }
-        );
-      }
-    }
+    // What happened on the call (no answer, busy... or the AI's reading of it).
+    if (call && isEnded) outcomeService.request(call._id).catch(() => {});
 
     res.sendStatus(200);
   } catch (error) {
@@ -330,26 +314,8 @@ exports.handlePlivoStatusCallback = async (req, res) => {
       }
     }
 
-    if (call && call.campaign_id && isEnded) {
-      let executionStatus = 'PENDING';
-      const effectiveStatus = mappedCallStatus || CallStatus;
-      if (effectiveStatus === 'completed') executionStatus = 'CONTACT SUCCESSFUL';
-      else if (effectiveStatus === 'failed' || effectiveStatus === 'no-answer' || effectiveStatus === 'missed') executionStatus = 'CALL FAILED';
-      else if (effectiveStatus === 'busy' || effectiveStatus === 'declined') executionStatus = 'LINE BUSY';
-      else if (effectiveStatus === 'canceled') executionStatus = 'CANCELED';
-
-      if (CampaignHistory) {
-        await CampaignHistory.findOneAndUpdate(
-          { campaignId: call.campaign_id, leadPhone: call.to_number },
-          {
-            callStatus: executionStatus,
-            callDuration: call.duration || 0,
-            recordingUrl: call.recording_url || null
-          },
-          { new: true }
-        );
-      }
-    }
+    // What happened on the call (no answer, busy... or the AI's reading of it).
+    if (call && isEnded) outcomeService.request(call._id).catch(() => {});
 
     res.sendStatus(200);
   } catch (error) {
@@ -577,16 +543,6 @@ exports.handleRecordingCallback = async (req, res) => {
         const { processCallTranscription } = require('./transcription.helper');
         processCallTranscription(call._id, RecordingUrl);
       }
-
-      if (call && call.campaign_id) {
-        if (CampaignHistory) {
-          await CampaignHistory.findOneAndUpdate(
-            { campaignId: call.campaign_id, leadPhone: call.to_number },
-            { recordingUrl: RecordingUrl },
-            { new: true }
-          );
-        }
-      }
     }
 
     res.sendStatus(200);
@@ -596,30 +552,39 @@ exports.handleRecordingCallback = async (req, res) => {
   }
 };
 
+// Filters shared by the Call Activity list and its export.
+const callLogQuery = (req) => {
+  const { search = '', status, direction, outcome, reached, sentiment, agent_id, campaign_id, from, to } = req.query;
+  const query = { user_id: req.user.id };
+  const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (search) {
+    const rx = { $regex: escapeRegex(search), $options: 'i' };
+    query.$or = [{ from_number: rx }, { to_number: rx }, { status: rx }, { direction: rx }, { lead_name: rx }, { 'outcome.summary': rx }];
+  }
+  if (status) {
+    // Status callbacks save busy as 'declined' and no-answer as 'missed'.
+    const sameAs = { busy: ['busy', 'declined'], 'no-answer': ['no-answer', 'missed'] };
+    query.status = sameAs[status] ? { $in: sameAs[status] } : status;
+  }
+  if (direction) query.direction = direction;
+  if (outcome) query['outcome.key'] = outcome === 'none' ? null : outcome;
+  if (reached === 'true' || reached === 'false') query['outcome.reached'] = reached === 'true';
+  if (sentiment) query['outcome.sentiment'] = sentiment;
+  if (agent_id && db.mongoose.Types.ObjectId.isValid(agent_id)) query.agent_id = agent_id;
+  if (campaign_id && db.mongoose.Types.ObjectId.isValid(campaign_id)) query.campaign_id = campaign_id;
+  if (from || to) {
+    query.created_at = {};
+    if (from && !Number.isNaN(new Date(from).getTime())) query.created_at.$gte = new Date(from);
+    if (to && !Number.isNaN(new Date(to).getTime())) query.created_at.$lte = new Date(to);
+  }
+  return query;
+};
+
 exports.getCallLogs = async (req, res) => {
   try {
-    const userId = req.user.id;
-    const { page = 1, limit = 100, search = '', status, direction, sortColumn, sortOrder, prioritizeRestricted } = req.query;
+    const { page = 1, limit = 100, sortColumn, sortOrder, prioritizeRestricted } = req.query;
 
-    const query = { user_id: userId };
-
-    if (search) {
-      query.$or = [
-        { from_number: { $regex: search, $options: 'i' } },
-        { to_number: { $regex: search, $options: 'i' } },
-        { status: { $regex: search, $options: 'i' } },
-        { direction: { $regex: search, $options: 'i' } },
-        { lead_name: { $regex: search, $options: 'i' } }
-      ];
-    }
-
-    if (status) {
-      query.status = status;
-    }
-
-    if (direction) {
-      query.direction = direction;
-    }
+    const query = callLogQuery(req);
 
     let sortObj = {};
     if (prioritizeRestricted === 'true') {
@@ -660,6 +625,48 @@ exports.getCallLogs = async (req, res) => {
   }
 };
 
+const contactName = (contact) => [contact?.first_name, contact?.last_name].filter(Boolean).join(' ') || undefined;
+
+// A caller who isn't a contact yet is saved as one once the call is answered,
+// off the answer path, so their calls, outcome and follow-ups belong to a person.
+const linkNewCaller = (callLog, userId, from) => {
+  findOrCreateContact(Contact, userId, from, { source: 'inbound_call' })
+    .then(contact => contact && Call.updateOne({ _id: callLog._id }, { $set: { contact_id: contact._id } }))
+    .catch(err => console.error('Could not save the caller as a contact:', err.message));
+};
+
+// Call Activity as a CSV (same filters as the list), with each call's outcome.
+exports.exportCallLogs = async (req, res) => {
+  try {
+    const { toCsv, istDateTime } = require('../utils/csv');
+    const calls = await Call.find(callLogQuery(req))
+      .sort({ created_at: -1 })
+      .limit(10000)
+      .populate('agent_id', 'name')
+      .populate('campaign_id', 'name')
+      .populate('contact_id', 'first_name last_name')
+      .select('-transcript -execution_logs')
+      .lean();
+    const detailKeys = [...new Set(calls.flatMap(c => Object.keys(c.outcome?.details || {})))];
+    const rows = [['Date (IST)', 'Direction', 'Number', 'Name', 'Agent', 'Campaign', 'Status', 'Duration (s)', 'Outcome', 'Summary', 'Sentiment', 'Follow-up', 'Recording', ...detailKeys]];
+    for (const c of calls) {
+      const name = [c.contact_id?.first_name, c.contact_id?.last_name].filter(Boolean).join(' ') || c.lead_name || '';
+      rows.push([
+        istDateTime(c.created_at), c.direction, c.direction === 'inbound' ? c.from_number : c.to_number, name,
+        c.agent_id?.name || '', c.campaign_id?.name || '', c.status, c.duration || 0,
+        c.outcome?.label || '', c.outcome?.summary || '', c.outcome?.sentiment || '', istDateTime(c.outcome?.follow_up?.at),
+        c.recording_url || '', ...detailKeys.map(k => c.outcome?.details?.[k])
+      ]);
+    }
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="calls-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send(toCsv(rows));
+  } catch (error) {
+    console.error('Export Call Logs Error:', error);
+    res.status(500).json({ success: false, message: 'Internal Server Error' });
+  }
+};
+
 exports.handleInboundCall = async (req, res) => {
   try {
     if (req.body?.widgetKey || req.query?.widgetKey) {
@@ -681,7 +688,7 @@ exports.handleInboundCall = async (req, res) => {
     const userId = agent.user_id;
     prepareGreeting({ agent, flowId, userId });
 
-    const contact = await Contact.findOne({ user_id: userId, phone_number: From });
+    const contact = await findContactByPhone(Contact, userId, From);
     if (contact && contact.is_blocked) {
       const blockTwiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Reject reason="busy"/></Response>`;
       res.type('text/xml');
@@ -697,8 +704,10 @@ exports.handleInboundCall = async (req, res) => {
       to_number: To,
       status: 'in-progress',
       direction: 'inbound',
-      contact_id: contact ? contact._id : null
+      contact_id: contact ? contact._id : null,
+      lead_name: contactName(contact)
     });
+    if (!contact) linkNewCaller(callLog, userId, From);
     webhookDispatcher.dispatchEvent(userId, 'Inbound Call Arrived', callLog);
 
     const appUrl = process.env.APP_URL.replace('http', 'ws');
@@ -804,7 +813,7 @@ exports.handlePlivoInboundCall = async (req, res) => {
     const userId = agent.user_id;
     prepareGreeting({ agent, flowId, userId });
 
-    const contact = await Contact.findOne({ user_id: userId, phone_number: { $in: numberVariants(From) } });
+    const contact = await findContactByPhone(Contact, userId, From);
     if (contact && contact.is_blocked) {
       const blockXml = `<?xml version="1.0" encoding="UTF-8"?><Response><Hangup reason="busy"/></Response>`;
       res.type('text/xml');
@@ -820,8 +829,10 @@ exports.handlePlivoInboundCall = async (req, res) => {
       to_number: To,
       status: 'in-progress',
       direction: 'inbound',
-      contact_id: contact ? contact._id : null
+      contact_id: contact ? contact._id : null,
+      lead_name: contactName(contact)
     });
+    if (!contact) linkNewCaller(callLog, userId, From);
     webhookDispatcher.dispatchEvent(userId, 'Inbound Call Arrived', callLog);
 
     res.type('text/xml');

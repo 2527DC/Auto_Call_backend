@@ -81,6 +81,17 @@ const BARGE_IN_GRACE_MS = 500;  // each utterance plays this long before it can 
 const RESUME_WITHIN_MS = 15000;
 const FILLER_WORD = /^(h?m+|mhm+|hm+|uh+|um+|huh|aha|ok+|okay|achh?a|accha|हम्म*|अच्छा|ओके|ಹ್ಮ್*|ಓಕೆ)$/;
 
+// Agents without a workflow: how to end a call well when the caller isn't
+// interested, is busy, or asks not to be called. The reply that says goodbye
+// ends with END_CALL_MARK, and the call ends once it has been said.
+const END_CALL_MARK = '[END_CALL]';
+const CALL_HANDLING_RULES = `CALL HANDLING:
+- If the caller says they are not interested, ask once, politely, whether another time would suit them better. If they still say no, thank them and say goodbye.
+- If the caller is busy or asks to be called later, ask what time suits them, repeat the time back, thank them and say goodbye.
+- If the caller asks not to be called again, or it is a wrong number, apologise briefly and say goodbye.
+- If the caller asks to speak to a person, say someone from the team will call them back, then say goodbye.
+- Only when you are saying goodbye and the conversation is over, end your reply with ${END_CALL_MARK}.`;
+
 class VoiceAutomationService extends EventEmitter {
   constructor() {
     super();
@@ -273,10 +284,11 @@ class VoiceAutomationService extends EventEmitter {
     clearTimeout(closingStream.maxDurationTimer);
     this.finishHello(closingStream, 'ended');
     if (closingStream.callSid) {
-      if (closingStream.usage) {
-        Call.updateOne({ twilio_call_sid: closingStream.callSid }, { $set: { usage: closingStream.usage } })
-          .catch((e) => console.error('[Usage] Could not save call usage:', e.message));
-      }
+      // The agent ended it (goodbye, silence, time limit), else the caller hung up.
+      const ended = { end_reason: closingStream.endReason || 'caller_hung_up' };
+      if (closingStream.usage) ended.usage = closingStream.usage;
+      Call.updateOne({ twilio_call_sid: closingStream.callSid }, { $set: ended })
+        .catch((e) => console.error('[Usage] Could not save call usage:', e.message));
       this.handleStreamCallCompletion(closingStream.callSid, closingStream.userId, closingStream.callStartTime);
       this.handlePostCallIntegrations(closingStream.callSid, closingStream.userId);
       this.plivoCallIds.delete(closingStream.callSid);
@@ -298,13 +310,14 @@ class VoiceAutomationService extends EventEmitter {
 
   // Whether caller audio counts towards their next turn (while the agent
   // talks it goes to watchForBargeIn instead). While the AI works on a reply
-  // in free conversation the caller is still heard; a flow waits for its step.
+  // the caller is still heard; in a workflow those words only count if they
+  // end the conversation ("not interested"), see answerHeldWords.
   hearsCaller(stream) {
     if (stream.ending) return false;
     if (stream.callerHasFloor) return true;
     if (stream.pendingPlaybacks > 0 || Date.now() < (stream.listenAfter || 0)) return false;
     if (!stream.processingTurn) return true;
-    return !!stream.answering && !stream.flowId && !!this.interruptionRule(stream.agent);
+    return !!stream.answering && !!this.interruptionRule(stream.agent);
   }
 
   // Drops buffered caller audio older than the lead-in kept before speech.
@@ -338,6 +351,14 @@ class VoiceAutomationService extends EventEmitter {
     const barge = stream.bargeIn || (stream.bargeIn = { speechMs: 0, silenceMs: 0 });
     const chunkMs = chunk.length / 8;
     stream.audioBuffer.push(chunk);
+    if (rms > SPEECH_RMS_THRESHOLD) {
+      const heard = stream.overTalk || (stream.overTalk = { peak: 0, longestMs: 0, runMs: 0 });
+      heard.peak = Math.max(heard.peak, Math.round(rms));
+      heard.runMs += chunkMs;
+      heard.longestMs = Math.max(heard.longestMs, heard.runMs);
+    } else if (stream.overTalk) {
+      stream.overTalk.runMs = 0;
+    }
     if (rms > rule.rms) {
       barge.speechMs += chunkMs;
       barge.silenceMs = 0;
@@ -351,6 +372,7 @@ class VoiceAutomationService extends EventEmitter {
     }
     if (barge.speechMs < rule.speechMs) return;
 
+    stream.overTalk = null;
     this.interruptAgent(stream, streamSid, ws, now);
     this.giveCallerTheFloor(stream, barge);
   }
@@ -390,6 +412,8 @@ class VoiceAutomationService extends EventEmitter {
       entry.text = heard || '…';
       entry.interrupted = true;
     }
+    // Marked on the call's transcript with the caller's next words (processCallerTurn).
+    stream.cutOff = { text: current.text, heard: heard || '' };
     const unheard = [rest, ...playing.slice(at + 1).map(p => p.text)].filter(Boolean).join(' ');
     stream.unheard = unheard ? {
       text: unheard,
@@ -424,6 +448,7 @@ class VoiceAutomationService extends EventEmitter {
   async resumeUnheard(stream, streamSid, ws, heard = '') {
     const unheard = stream.unheard;
     stream.unheard = null;
+    stream.cutOff = null;
     if (!unheard || stream.ending || Date.now() - unheard.at > RESUME_WITHIN_MS) return;
     console.log(`[Barge-in] Caller said ${heard ? `only "${heard}"` : 'nothing'}; finishing the agent's reply`);
     unheard.restore?.();
@@ -437,14 +462,16 @@ class VoiceAutomationService extends EventEmitter {
     return !!rule && (!!stream.heldAudio || (stream.isSpeaking && stream.speechMs >= rule.speechMs));
   }
 
-  // Answers words the caller finished while their previous turn was still being handled.
+  // Answers words the caller finished while their previous turn was still being
+  // handled. A workflow has already moved on to its next question, so there
+  // they only count if they end the conversation.
   answerHeldWords(streamSid, ws) {
     const stream = this.activeStreams.get(streamSid);
     if (!stream?.heldAudio || stream.processingTurn) return;
     const audio = stream.heldAudio;
     stream.heldAudio = null;
     if (stream.ending || stream.pendingTransfer) return;
-    this.handleCompleteSpeech(streamSid, ws, audio).catch(err => console.error(err));
+    this.handleCompleteSpeech(streamSid, ws, audio, { exitsOnly: !!stream.flowId }).catch(err => console.error(err));
   }
 
   greetingText(agent) {
@@ -647,6 +674,14 @@ class VoiceAutomationService extends EventEmitter {
       streamForMark.pendingPlaybacks--;
       if (streamForMark.pendingPlaybacks === 0) {
         streamForMark.playing = [];
+        // The caller spoke over the agent without cutting it off: logged so the
+        // interruption sensitivity can be checked against real calls.
+        const overTalk = streamForMark.overTalk;
+        streamForMark.overTalk = null;
+        const rule = this.interruptionRule(streamForMark.agent);
+        if (overTalk && rule && overTalk.longestMs >= 100) {
+          console.log(`[Barge-in] Caller spoke over the agent without cutting it off: loudest ${overTalk.peak}, longest ${Math.round(overTalk.longestMs)}ms (needs over ${rule.rms} for ${rule.speechMs}ms)`);
+        }
         const barge = streamForMark.bargeIn;
         streamForMark.bargeIn = null;
         if (barge?.speechMs && !streamForMark.ending) {
@@ -692,6 +727,7 @@ class VoiceAutomationService extends EventEmitter {
   async hangUp(stream, reason) {
     if (!stream?.callSid || stream.hungUp) return;
     stream.hungUp = true;
+    stream.endReason = stream.endReason || reason;
     const client = await this.getCallControlClient(stream.userId);
     if (!client) return;
     try {
@@ -713,6 +749,7 @@ class VoiceAutomationService extends EventEmitter {
     clearTimeout(stream.maxDurationTimer);
     const agent = stream.agent;
     console.log(`[Call] Ending call ${stream.callSid}: ${reason}`);
+    stream.endReason = reason;
     stream.pendingTerminate = true;
     setTimeout(() => {
       if (this.activeStreams.has(streamSid)) this.hangUp(stream, `${reason}, goodbye did not finish`);
@@ -920,12 +957,13 @@ class VoiceAutomationService extends EventEmitter {
                 }
 
                 if (result.final_data) {
-                  const { agent, aiConfig, userId, call, ...cleanFinalData } = result.final_data;
                   callLog.extracted_data = {
                     ...(callLog.extracted_data || {}),
-                    ...cleanFinalData
+                    ...automationEngine.savedFlowData(result.final_data)
                   };
                 }
+                if (result.callState) callLog.conversation_state = result.callState;
+                if (result.signals?.length) callLog.live_signals.push(...result.signals);
                 await callLog.save();
 
                 const redirectLog = result.logs.find(l => l.node_type === 'redirect_call');
@@ -1138,7 +1176,7 @@ class VoiceAutomationService extends EventEmitter {
 
   // One caller turn at a time. Words the caller finishes while a turn is still
   // being handled are held and answered right after it.
-  async handleCompleteSpeech(streamSid, ws, audioBuffer) {
+  async handleCompleteSpeech(streamSid, ws, audioBuffer, opts = {}) {
     const stream = this.activeStreams.get(streamSid);
     if (!stream) return;
     if (stream.processingTurn) {
@@ -1149,7 +1187,7 @@ class VoiceAutomationService extends EventEmitter {
     stream.answering = true;
     const turnStartedAt = Date.now();
     try {
-      await this.processCallerTurn(stream, streamSid, ws, audioBuffer);
+      await this.processCallerTurn(stream, streamSid, ws, audioBuffer, opts);
     } finally {
       stream.processingTurn = false;
       stream.answering = false;
@@ -1158,7 +1196,19 @@ class VoiceAutomationService extends EventEmitter {
     this.answerHeldWords(streamSid, ws);
   }
 
-  async processCallerTurn(stream, streamSid, ws, audioBuffer) {
+  // Saves what the caller made clear ("not interested", "call me at 6") and
+  // where the workflow conversation stands, straight away: a transfer or a
+  // hang-up may follow before the call log is saved again.
+  async saveConversationProgress(callLog, result) {
+    const update = { $set: { conversation_state: result.callState || {} } };
+    if (result.signals?.length) {
+      update.$push = { live_signals: { $each: result.signals } };
+      console.log(`[Flow] Caller: ${result.signals.map(sg => sg.type).join(', ')}`);
+    }
+    await Call.updateOne({ _id: callLog._id }, update).catch(err => console.error('[Flow] Could not save conversation progress:', err.message));
+  }
+
+  async processCallerTurn(stream, streamSid, ws, audioBuffer, { exitsOnly = false } = {}) {
     if (stream.ending) return;
     const text = await this.processSTT(audioBuffer, stream.userId, stream.agentId, stream.flowId);
     if (stream.ending) return;
@@ -1168,8 +1218,10 @@ class VoiceAutomationService extends EventEmitter {
       return;
     }
     stream.unheard = null;
+    const cutOff = stream.cutOff;
+    stream.cutOff = null;
 
-    console.log(`Processing complete sentence: "${text}"`);
+    console.log(`Processing complete sentence: "${text}"${exitsOnly ? ' (said while the agent was busy)' : ''}`);
 
     let currentAgentForChecks = null;
     if (stream.agentId) {
@@ -1293,6 +1345,15 @@ class VoiceAutomationService extends EventEmitter {
         }
       }
 
+      // The caller cut the agent off: the transcript shows how much they heard.
+      if (cutOff) {
+        const line = [...(currentCallLog.transcript || [])].reverse().find(m => m.role === 'agent' && m.text === cutOff.text);
+        if (line) {
+          line.interrupted = true;
+          line.heard = cutOff.heard;
+        }
+      }
+
       if (stream.agentId) {
         const agent = await Agent.findById(stream.agentId);
         if (agent?.enable_call_transcription !== false) {
@@ -1326,12 +1387,19 @@ class VoiceAutomationService extends EventEmitter {
               appointment_details: currentCallLog.extracted_data?.appointment_details || {},
               form_responses: currentCallLog.extracted_data?.form_responses || {},
               current_field_index: currentCallLog.extracted_data?.current_field_index || 0,
-              form_id: currentCallLog.extracted_data?.form_id || null
+              form_id: currentCallLog.extracted_data?.form_id || null,
+              call_state: currentCallLog.conversation_state || {},
+              exits_only: exitsOnly
             },
             stream.currentNodeId
           );
 
+          if (result.ignored) {
+            console.log('[Flow] Words said while the agent was busy did not end the conversation; not answered');
+            return;
+          }
           stream.currentNodeId = result.currentNodeId;
+          await this.saveConversationProgress(currentCallLog, result);
 
           const messages = result.logs.filter(l => l.output && l.output.last_message).map(l => l.output.last_message);
           const nextResponse = messages.join(' ');
@@ -1429,10 +1497,9 @@ class VoiceAutomationService extends EventEmitter {
           }
 
           if (result.final_data) {
-            const { agent, aiConfig, userId, call, user_input, ...cleanFinalData } = result.final_data;
             currentCallLog.extracted_data = {
               ...(currentCallLog.extracted_data || {}),
-              ...cleanFinalData
+              ...automationEngine.savedFlowData(result.final_data)
             };
           }
           await currentCallLog.save();
@@ -1457,6 +1524,7 @@ class VoiceAutomationService extends EventEmitter {
           if (currentAgent.custom_knowledge_base) {
             systemPrompt += `\n\nADDITIONAL KNOWLEDGE BASE:\n${currentAgent.custom_knowledge_base}`;
           }
+          systemPrompt += `\n\n${CALL_HANDLING_RULES}`;
 
           const rawResponse = await llmService.generateResponseWithSystemPrompt(
             fullPrompt,
@@ -1471,7 +1539,9 @@ class VoiceAutomationService extends EventEmitter {
             }
           );
           // The model sometimes labels its turn ("Assistant: ..."), which would be spoken aloud.
-          const nextResponse = (rawResponse || '').replace(/^\s*(assistant|agent|ai)\s*(\([^)]*\))?\s*:\s*/i, '');
+          const labelled = (rawResponse || '').replace(/^\s*(assistant|agent|ai)\s*(\([^)]*\))?\s*:\s*/i, '');
+          const endsCall = labelled.includes(END_CALL_MARK);
+          const nextResponse = labelled.split(END_CALL_MARK).join(' ').replace(/\s+/g, ' ').trim();
 
           // The caller said more while this reply was being written: it is not
           // played, and their new words are answered together with these.
@@ -1489,7 +1559,8 @@ class VoiceAutomationService extends EventEmitter {
 
           if (nextResponse && nextResponse.trim()) {
             stream.conversationHistory.push({ role: 'assistant', text: nextResponse });
-            await this.speak(ws, streamSid, nextResponse, currentAgent.voice_id, userSettings?.elevenlabs_api_key);
+            if (endsCall) await this.endCallWithGoodbye(streamSid, ws, 'agent said goodbye', nextResponse);
+            else await this.speak(ws, streamSid, nextResponse, currentAgent.voice_id, userSettings?.elevenlabs_api_key);
 
             if (currentAgent.enable_call_transcription !== false) {
               if (currentAgent?.enable_call_transcription) {
@@ -1777,6 +1848,8 @@ class VoiceAutomationService extends EventEmitter {
 
       call.post_call_handled = true;
       await call.save();
+      // What happened on the call: summary, outcome, details (after the call is marked complete).
+      require('./outcomeService').request(call._id).catch(() => {});
 
       const appointmentDetails = call.extracted_data?.appointment_details;
       if (appointmentDetails && appointmentDetails.date && appointmentDetails.time) {
@@ -1866,6 +1939,11 @@ class VoiceAutomationService extends EventEmitter {
           form_id: formId,
           call_id: call._id,
           flow_id: call.flow_id,
+          contact_id: call.contact_id || null,
+          phone: call.direction === 'inbound' ? call.from_number : call.to_number,
+          agent_id: call.agent_id || null,
+          campaign_id: call.campaign_id || null,
+          direction: call.direction,
           responses: formResponses,
           status: formCompleted ? 'completed' : 'partial'
         });
@@ -1920,7 +1998,10 @@ class VoiceAutomationService extends EventEmitter {
         }
       }
 
-      const userSettings = await UserSettings.findOne({ user: userId });
+      // No follow-up message to someone who asked not to be contacted, on this call or before.
+      const optedOut = (call.live_signals || []).some(sg => sg.type === 'do_not_call')
+        || (call.contact_id && require('../utils/doNotContact').isDoNotContact(await db.Contact.findById(call.contact_id).lean()));
+      const userSettings = optedOut ? null : await UserSettings.findOne({ user: userId });
       if (userSettings) {
         const channel = userSettings.post_call_channel || 'none';
         const toNumber = call.direction === 'inbound' ? call.from_number : call.to_number;

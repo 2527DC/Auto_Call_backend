@@ -138,6 +138,8 @@ Transcript: "${text}"`;
             updatedCall.transcript.push({ role: 'human', text: text });
         }
         await updatedCall.save();
+        // The call's outcome may have been waiting for this transcript.
+        require('../services/outcomeService').request(updatedCall._id, { delayMs: 1000 }).catch(() => {});
       }
     }
   } catch (transcriptionError) {

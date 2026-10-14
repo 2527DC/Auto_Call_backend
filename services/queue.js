@@ -24,6 +24,15 @@ const creditService = require('./creditService');
 const webhookDispatcher = require('./webhookDispatcher');
 const SmsSession = require('../models/sms-session.model');
 const SmsMessage = require('../models/sms-message.model');
+const { findContactByPhone } = require('../utils/phone');
+const { isAllowed, nextAllowed } = require('../utils/callingWindow');
+const { isDoNotContact } = require('../utils/doNotContact');
+
+// Campaign "Auto retry" for a finished call (see followUpService.scheduleRetry).
+const scheduleRetry = (call, campaign) => {
+  if (!call || !campaign?.autoRetrySettings?.enabled) return;
+  require('./followUpService').scheduleRetry(call, campaign).catch(err => console.error('[Campaign] Could not schedule a retry:', err.message));
+};
 
 let connection;
 let campaignQueue;
@@ -145,9 +154,27 @@ if (process.env.REDIS_URL) {
       let failCount = 0;
       let lastErrorMsg = '';
 
+      // Calls are placed only within the platform's calling hours and the
+      // campaign's own days and hours. Outside them the campaign waits: the job
+      // comes back at the next allowed time and skips contacts already called.
+      const platform = await require('./outcomeService').platformSettings();
+      const callingWindow = { platform: { start: platform.calling_window_start ?? 10, end: platform.calling_window_end ?? 21 }, schedule: campaign.callSchedule };
+
       let isStopped = false;
       if (uniqueContacts.length > 0) {
         for (const row of uniqueContacts) {
+          if (!isAllowed(new Date(), callingWindow)) {
+            const next = nextAllowed(new Date(), callingWindow);
+            isStopped = true;
+            if (next) {
+              await campaignQueue.add('process-campaign', { type: 'process-campaign', campaignId: String(campaignId) }, { delay: next.getTime() - Date.now() });
+              console.log(`Campaign ${campaignId} is outside its calling hours; continuing at ${next.toISOString()}`);
+            } else {
+              await Campaign.findByIdAndUpdate(campaignId, { campaignStatus: 'Paused', fail_reason: 'The campaign schedule never falls inside the allowed calling hours (10 AM to 9 PM).' });
+            }
+            break;
+          }
+
           const currentCampaign = await Campaign.findById(campaignId).select('campaignStatus');
           if (currentCampaign && ['Paused', 'Cancelled'].includes(currentCampaign.campaignStatus)) {
             console.log(`Campaign ${campaignId} was ${currentCampaign.campaignStatus}. Stopping execution.`);
@@ -173,11 +200,11 @@ if (process.env.REDIS_URL) {
           const to = row.to;
           const name = row.name;
 
-          const contactCheck = await Contact.findOne({ user_id: campaign.userId, phone_number: to });
-          if (contactCheck && contactCheck.is_blocked) {
+          const contactCheck = await findContactByPhone(Contact, campaign.userId, to);
+          if (isDoNotContact(contactCheck)) {
             console.log(`Skipping call to blocked contact: ${to}`);
             failCount++;
-            lastErrorMsg = 'Contact is blocked due to policy violations.';
+            lastErrorMsg = contactCheck.is_blocked ? 'Contact is blocked due to policy violations.' : 'This person asked not to be called (Do not call).';
             await Call.create({
               user_id: campaign.userId,
               flow_id: flowId,
@@ -189,16 +216,8 @@ if (process.env.REDIS_URL) {
               status: 'failed',
               direction: 'outbound',
               lead_name: name,
+              contact_id: contactCheck?._id || null,
               fail_reason: lastErrorMsg
-            });
-            const CampaignHistory = db.CampaignHistory;
-            await CampaignHistory.create({
-              campaignId: campaign._id,
-              leadName: name,
-              leadPhone: to,
-              callStatus: 'CALL FAILED',
-              callFailReason: lastErrorMsg,
-              callTime: new Date()
             });
             continue;
           }
@@ -218,7 +237,7 @@ if (process.env.REDIS_URL) {
                 phoneNumberId = waPhoneDoc.whatsapp_phone_number_id || waPhoneDoc.phone_number_id;
               }
 
-              const contactForCall = await db.Contact.findOne({ phone_number: to });
+              const contactForCall = contactCheck;
 
               const { sdp, pc, audioSource } = await whatsappWebrtcService.initiateOutboundCall(
                 phoneNumberId,
@@ -250,6 +269,7 @@ if (process.env.REDIS_URL) {
                 status: 'queued',
                 direction: 'outbound',
                 lead_name: name,
+              contact_id: contactCheck?._id || null,
               });
 
               await new Promise(resolve => setTimeout(resolve, 3000));
@@ -278,6 +298,7 @@ if (process.env.REDIS_URL) {
                 status: 'queued',
                 direction: 'outbound',
                 lead_name: name,
+              contact_id: contactCheck?._id || null,
               });
 
               await new Promise(resolve => setTimeout(resolve, 3000));
@@ -311,6 +332,7 @@ if (process.env.REDIS_URL) {
                 status: 'queued',
                 direction: 'outbound',
                 lead_name: name,
+              contact_id: contactCheck?._id || null,
               });
 
               let callStatus = 'queued';
@@ -333,10 +355,12 @@ if (process.env.REDIS_URL) {
               if (callStatus === 'busy') mappedCallStatus = 'declined';
               if (callStatus === 'no-answer') mappedCallStatus = 'missed';
 
-              await Call.findOneAndUpdate(
+              const finishedCall = await Call.findOneAndUpdate(
                 { twilio_call_sid: plivoCall.requestUuid },
-                { status: mappedCallStatus, ended_at: new Date() }
+                { status: mappedCallStatus, ended_at: new Date() },
+                { new: true }
               );
+              scheduleRetry(finishedCall, campaign);
 
               successCount++;
             } else {
@@ -364,6 +388,7 @@ if (process.env.REDIS_URL) {
                 status: 'queued',
                 direction: 'outbound',
                 lead_name: name,
+              contact_id: contactCheck?._id || null,
               });
 
               let callStatus = call.status;
@@ -386,17 +411,19 @@ if (process.env.REDIS_URL) {
               if (callStatus === 'busy') mappedCallStatus = 'declined';
               if (callStatus === 'no-answer') mappedCallStatus = 'missed';
 
-              await Call.findOneAndUpdate(
+              const finishedCall = await Call.findOneAndUpdate(
                 { twilio_call_sid: call.sid },
-                { status: mappedCallStatus, ended_at: new Date() }
+                { status: mappedCallStatus, ended_at: new Date() },
+                { new: true }
               );
+              scheduleRetry(finishedCall, campaign);
 
               successCount++;
             }
           } catch (error) {
             failCount++;
             lastErrorMsg = error.message;
-            await Call.create({
+            const failedCall = await Call.create({
               user_id: campaign.userId,
               flow_id: flowId,
               agent_id: campaign.agentId,
@@ -407,10 +434,10 @@ if (process.env.REDIS_URL) {
               status: 'failed',
               direction: 'outbound',
               lead_name: name,
+              contact_id: contactCheck?._id || null,
               fail_reason: error.message
             });
-
-
+            scheduleRetry(failedCall, campaign);
           }
         }
       }
@@ -455,6 +482,7 @@ if (process.env.REDIS_URL) {
         console.log(`Triggering post-campaign WhatsApp for campaign ${campaignId}`);
         for (const contact of uniqueContacts) {
           try {
+            if (isDoNotContact(await findContactByPhone(Contact, campaign.userId, contact.to))) continue;
             await whatsappService.sendTemplateMessage({
               userId: campaign.userId,
               to: contact.to,
@@ -580,8 +608,8 @@ if (process.env.REDIS_URL) {
           const to = row.to;
           const name = row.name;
 
-          const contactCheck = await Contact.findOne({ user_id: campaign.user_id, phone_number: to });
-          if (contactCheck && contactCheck.is_blocked) {
+          const contactCheck = await findContactByPhone(Contact, campaign.user_id, to);
+          if (isDoNotContact(contactCheck)) {
             console.log(`Skipping SMS to blocked contact: ${to}`);
             failCount++;
             lastErrorMsg = 'Contact is blocked due to policy violations.';

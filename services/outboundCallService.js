@@ -7,6 +7,8 @@ const creditService = require('./creditService');
 const elevenLabsService = require('./elevenlabsService');
 const webhookDispatcher = require('./webhookDispatcher');
 const plivoService = require('./plivoService');
+const { findContactByPhone } = require('../utils/phone');
+const { isDoNotContact } = require('../utils/doNotContact');
 
 const httpError = (status, message) => Object.assign(new Error(message), { status });
 
@@ -16,10 +18,14 @@ const prepareGreeting = (args) => require('./voiceAutomationService').prepareGre
 
 // Places an outbound AI call and returns its call log. Used by the dialer and by
 // WhatsApp automations. Errors carry the HTTP status the dialer should answer with.
-const placeCall = async ({ userId, isAdmin = false, flowId, agentId, phoneNumber, fromNumber }) => {
-  const contact = await Contact.findOne({ user_id: userId, phone_number: phoneNumber });
+// callFields: extra fields for the call record (e.g. follow_up_id, campaign_id).
+const placeCall = async ({ userId, isAdmin = false, flowId, agentId, phoneNumber, fromNumber, callFields = {} }) => {
+  const contact = await findContactByPhone(Contact, userId, phoneNumber);
   if (contact && contact.is_blocked) {
     throw httpError(403, 'This contact is blocked due to policy violations.');
+  }
+  if (isDoNotContact(contact)) {
+    throw httpError(403, 'This person asked not to be called. Change their lead status first if they agreed to be contacted again.');
   }
 
   let agent;
@@ -80,7 +86,8 @@ const placeCall = async ({ userId, isAdmin = false, flowId, agentId, phoneNumber
       to_number: phoneNumber,
       status: 'queued',
       direction: 'outbound',
-      contact_id: contact ? contact._id : null
+      contact_id: contact ? contact._id : null,
+      ...callFields
     });
     webhookDispatcher.dispatchEvent(userId, 'Call Initiated', callLog);
   } else if (sourceNumber.provider === 'plivo' || sourceNumber.type === 'sip') {
@@ -113,7 +120,8 @@ const placeCall = async ({ userId, isAdmin = false, flowId, agentId, phoneNumber
       to_number: phoneNumber,
       status: 'queued',
       direction: 'outbound',
-      contact_id: contact ? contact._id : null
+      contact_id: contact ? contact._id : null,
+      ...callFields
     });
     webhookDispatcher.dispatchEvent(userId, 'Call Initiated', callLog);
   } else {
@@ -143,7 +151,8 @@ const placeCall = async ({ userId, isAdmin = false, flowId, agentId, phoneNumber
       to_number: phoneNumber,
       status: twilioCall.status || 'queued',
       direction: 'outbound',
-      contact_id: contact ? contact._id : null
+      contact_id: contact ? contact._id : null,
+      ...callFields
     });
     webhookDispatcher.dispatchEvent(userId, 'Call Initiated', callLog);
   }

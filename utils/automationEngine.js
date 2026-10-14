@@ -13,6 +13,8 @@ const axios = require('axios');
 const { sendMail } = require('../utils/mail');
 const webhookDispatcher = require('../services/webhookDispatcher');
 const creditService = require('../services/creditService');
+const callerUnderstanding = require('./callerUnderstanding');
+const { cleanFieldValue } = require('./fieldValue');
 
 class AutomationEngine {
   constructor() {
@@ -29,6 +31,7 @@ class AutomationEngine {
       email_notice: this.executeEmailNotice.bind(this),
       variable_map: this.executeVariableMap.bind(this),
       audio_playback: this.executeAudioPlayback.bind(this),
+      set_outcome: this.executeSetOutcome.bind(this),
     };
   }
 
@@ -56,6 +59,26 @@ class AutomationEngine {
     }
 
     const startTime = Date.now();
+
+    // The caller's reply to the step that was waiting for it is understood
+    // first: an answer goes on to the step; "not interested", "call me later",
+    // "hello?", a side question etc. are answered here and the step waits again.
+    // exits_only: words said while the agent was busy only count if they end
+    // the conversation ("not interested", "don't call me").
+    let callState = { ...(inputData.call_state || {}) };
+    if (inputData.user_input && currentNode && callerUnderstanding.LISTENING_NODES.includes(currentNode.type) && callerUnderstanding.isOn(flow)) {
+      const handled = await callerUnderstanding.handle({ flow, node: currentNode, data: currentData });
+      const ends = handled.stop?.signals?.length;
+      if (inputData.exits_only && !ends) return { success: true, ignored: true, logs: [], final_data: currentData, currentNodeId: currentNode.id, shouldPause: true, callState: inputData.call_state || {} };
+      const newState = handled.state || handled.stop?.state;
+      if (newState) callState = newState;
+      if (handled.stop) return this.callerReplyResult(currentNode, currentData, callState, handled.stop, startTime);
+      if (handled.understood) currentData.understood = handled.understood;
+    } else if (inputData.exits_only) {
+      return { success: true, ignored: true, logs: [], final_data: currentData, currentNodeId: currentNode?.id || null, shouldPause: true, callState: inputData.call_state || {} };
+    }
+    currentData.call_state = callState;
+
     let steps = 0;
     const maxSteps = 50;
     // One caller utterance answers one question. Once a capture node has used
@@ -64,6 +87,8 @@ class AutomationEngine {
     const captureNodes = ['input_capture', 'data_capture', 'book_slot', 'email_notice'];
     let inputConsumed = false;
     let lastSpokenMessage = null;
+    // Things the call made clear on the way (a "Set outcome" step), saved on the call.
+    const signals = [];
 
     while (currentNode && steps < maxSteps) {
       steps++;
@@ -75,6 +100,7 @@ class AutomationEngine {
       });
       if (isCapture && nodeData.user_input) inputConsumed = true;
       if (nodeResult.output?.last_message) lastSpokenMessage = nodeResult.output.last_message;
+      if (nodeResult.signal) signals.push({ node_id: currentNode.id, at: new Date(), ...nodeResult.signal });
 
       executionLog.push({
         node_id: currentNode.id,
@@ -109,13 +135,16 @@ class AutomationEngine {
             webhookDispatcher.dispatchEvent(uId, 'Flow Finished', { flowId: flow._id, name: flow.name, type: currentNode.type });
           }
         }
+        if (lastSpokenMessage) callState.last_question = lastSpokenMessage;
         return {
           success: true,
           execution_time: Date.now() - startTime,
           logs: executionLog,
-          final_data: currentData,
+          final_data: { ...currentData, call_state: callState },
           currentNodeId: nodeResult.advanceOnPause ? nextNodeId : currentNode.id,
-          shouldPause: true
+          shouldPause: true,
+          callState,
+          signals
         };
       }
 
@@ -136,8 +165,44 @@ class AutomationEngine {
       logs: executionLog,
       final_data: currentData,
       currentNodeId: currentNode ? currentNode.id : null,
-      shouldPause: false
+      shouldPause: false,
+      callState,
+      signals
     };
+  }
+
+  // The flow result when the caller's reply was answered without running the
+  // step: what to say, a transfer, or the end of the call. The step waits again.
+  callerReplyResult(node, data, callState, stop, startTime) {
+    const at = new Date();
+    const logs = [];
+    if (stop.say) logs.push({ node_id: node.id, node_type: 'caller_reply', status: 'success', output: { last_message: stop.say }, timestamp: at });
+    if (stop.transfer) logs.push({ node_id: node.id, node_type: 'redirect_call', status: 'success', output: stop.transfer, timestamp: at });
+    if (stop.endCall) logs.push({ node_id: node.id, node_type: 'terminate_call', status: 'success', output: { reason: 'caller_reply' }, synthetic: true, timestamp: at });
+    return {
+      success: true,
+      execution_time: Date.now() - startTime,
+      logs,
+      final_data: { ...data, call_state: callState },
+      currentNodeId: node.id,
+      shouldPause: true,
+      endCall: !!stop.endCall,
+      signals: stop.signals || [],
+      callState
+    };
+  }
+
+  // The workflow state worth keeping on the call: the caller's answers and what
+  // the next turn needs. Leaves out the run's inputs (agent, AI keys, the call)
+  // and each step's scratch values (what was just said, step labels).
+  savedFlowData(finalData = {}) {
+    const {
+      agent, aiConfig, userId, call, user_input,
+      last_message, description, prompt, extracted_data, play_audio, transfer_text,
+      understood, call_state, exits_only, can_transfer, outcome_set,
+      ...kept
+    } = finalData || {};
+    return kept;
   }
 
   async executeNode(node, data, context = {}) {
@@ -190,6 +255,14 @@ class AutomationEngine {
     }
 
     return messages.join(' ') || null;
+  }
+
+  // Decides the call's outcome (e.g. "Appointment booked") instead of the AI.
+  // Says nothing and moves straight on.
+  async executeSetOutcome(node) {
+    const key = node.data?.outcome_key;
+    if (!key) return { success: true, output: {}, shouldPause: false };
+    return { success: true, output: { outcome_set: key }, signal: { type: 'set_outcome', outcome_key: key, said: node.data?.note || node.data?.description || undefined }, shouldPause: false };
   }
 
   async executeMessageOutput(node, data) {
@@ -493,12 +566,17 @@ class AutomationEngine {
       let extractedData = data.extracted_data || {};
 
       if (data.user_input) {
-        const extractedValue = await llmService.extractFormFieldValue(
-          data.user_input,
-          fieldName,
-          node.data.question || node.data.text || node.data.description,
-          data.aiConfig
-        );
+        // Already read by callerUnderstanding (one AI request for both); else asked here.
+        const understood = data.understood?.node_id === node.id ? data.understood : null;
+        if (understood?.skipped) return { success: true, output: {}, shouldPause: false };
+        const extractedValue = understood
+          ? understood.value
+          : await llmService.extractFormFieldValue(
+            data.user_input,
+            fieldName,
+            node.data.question || node.data.text || node.data.description,
+            data.aiConfig
+          );
 
         if (extractedValue !== null) {
           extractedData[fieldName] = extractedValue;
@@ -516,7 +594,7 @@ class AutomationEngine {
           return {
             success: true,
             output: {
-              last_message: `I didn't quite catch that. ${node.data.question || node.data.description}`
+              last_message: `I didn't quite catch that. ${callerUnderstanding.stripFiller(node.data.question || node.data.description)}`
             },
             shouldPause: true
           };
@@ -558,15 +636,20 @@ class AutomationEngine {
     let prompt = currentField.question;
 
     if (data.user_input) {
-      const extractedValue = await llmService.extractFormFieldValue(
-        data.user_input,
-        currentField.label,
-        currentField.question,
-        data.aiConfig
-      );
+      // Already read and checked by callerUnderstanding; else asked and checked here.
+      const understood = data.understood?.node_id === node.id ? data.understood : null;
+      const extractedValue = understood
+        ? understood.value
+        : cleanFieldValue(currentField, await llmService.extractFormFieldValue(
+          data.user_input,
+          currentField.label,
+          currentField.question,
+          data.aiConfig
+        ));
 
-      if (extractedValue !== null) {
-        responses[currentField.key] = extractedValue;
+      // An optional question the caller didn't answer is skipped.
+      if (extractedValue !== null || understood?.skipped || currentField.required === false) {
+        if (extractedValue !== null) responses[currentField.key] = extractedValue;
         currentFieldIndex++;
 
         if (currentFieldIndex < fields.length) {
@@ -599,7 +682,7 @@ class AutomationEngine {
         return {
           success: true,
           output: {
-            last_message: `I didn't quite catch that. ${currentField.question}`,
+            last_message: `I didn't quite catch that. ${callerUnderstanding.stripFiller(currentField.question)}`,
             form_responses: responses,
             current_field_index: currentFieldIndex,
             form_id: formId

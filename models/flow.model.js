@@ -39,7 +39,8 @@ const FlowSchema = new Schema(
             'terminate_call',
             'variable_map',
             'agent_jump',
-            'team_alert'
+            'team_alert',
+            'set_outcome'
           ]
         },
         position: {
@@ -69,6 +70,11 @@ const FlowSchema = new Schema(
     system_flow: {
       type: Boolean,
       default: false
+    },
+    // How calls on this workflow treat replies that aren't answers (see utils/callerUnderstanding.js).
+    settings: {
+      understand_caller: { type: Boolean, default: true },
+      max_reasks: { type: Number, default: 2, min: 0, max: 5 }
     },
     deleted_at: {
       type: Date,

@@ -3,6 +3,7 @@ const Contact = db.Contact;
 const fs = require('fs');
 const csv = require('fast-csv');
 const { checkFeatureLimit } = require('../utils/limitHelper');
+const { findContactByPhone } = require('../utils/phone');
 
 exports.createContact = async (req, res) => {
   try {
@@ -15,7 +16,8 @@ exports.createContact = async (req, res) => {
     const currentContactsCount = await Contact.countDocuments({ user_id: req.user._id });
     await checkFeatureLimit(req.user._id, 'Contact', 'contact_limit', currentContactsCount);
 
-    const existingContact = await Contact.findOne({ user_id: req.user._id, phone_number });
+    // The same number typed differently ("98450 12345" / "+919845012345") is the same person.
+    const existingContact = await findContactByPhone(Contact, req.user._id, phone_number);
     if (existingContact) {
       return res.status(409).json({ success: false, message: 'Contact with this phone number already exists' });
     }
@@ -85,8 +87,8 @@ exports.updateContact = async (req, res) => {
     }
 
     if (phone_number && phone_number !== contact.phone_number) {
-      const existingContact = await Contact.findOne({ user_id: req.user._id, phone_number });
-      if (existingContact) {
+      const existingContact = await findContactByPhone(Contact, req.user._id, phone_number);
+      if (existingContact && String(existingContact._id) !== String(contact._id)) {
         return res.status(409).json({ success: false, message: 'Another contact with this phone number already exists' });
       }
       contact.phone_number = phone_number;
@@ -164,7 +166,7 @@ exports.importContacts = async (req, res) => {
 
     for (const contact of contacts) {
       try {
-        const existing = await Contact.findOne({ user_id: req.user._id, phone_number: contact.phone_number });
+        const existing = await findContactByPhone(Contact, req.user._id, contact.phone_number);
         if (!existing) {
           await Contact.create(contact);
           added++;

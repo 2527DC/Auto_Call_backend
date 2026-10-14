@@ -110,6 +110,28 @@ exports.getAgentById = async (req, res) => {
   }
 };
 
+// After-call analysis settings: the form and sheet must be the client's own;
+// empty choices clear them. Returns an error message, or null.
+const checkAnalysis = async (analysis, userId) => {
+  if (!analysis || typeof analysis !== 'object') return null;
+  for (const key of ['form_id', 'google_sheet_id']) {
+    if (analysis[key] === '' || analysis[key] === 'none') analysis[key] = null;
+  }
+  if (analysis.form_id && !(db.mongoose.Types.ObjectId.isValid(analysis.form_id) && await db.Form.exists({ _id: analysis.form_id, user_id: userId }))) {
+    return 'Choose one of your Lead Capture Forms';
+  }
+  if (analysis.google_sheet_id && !(db.mongoose.Types.ObjectId.isValid(analysis.google_sheet_id) && await db.GoogleSheet.exists({ _id: analysis.google_sheet_id, user_id: userId }))) {
+    return 'Choose one of your Google Sheets';
+  }
+  if (analysis.follow_up_mode && !['default', 'ai_call', 'team', 'off'].includes(analysis.follow_up_mode)) {
+    return 'Choose who follows up';
+  }
+  for (const key of ['success_description', 'extra_instructions']) {
+    if (analysis[key] !== undefined) analysis[key] = String(analysis[key] || '').slice(0, 1000);
+  }
+  return null;
+};
+
 exports.createAgent = async (req, res) => {
   try {
     const userId = req.user.id;
@@ -121,6 +143,8 @@ exports.createAgent = async (req, res) => {
     if (agentData.tts_model && !elevenlabsService.allowedModels.includes(agentData.tts_model)) {
       return res.status(400).json({ success: false, message: 'This voice model is not available. Choose another one.' });
     }
+    const analysisError = await checkAnalysis(agentData.analysis, userId);
+    if (analysisError) return res.status(400).json({ success: false, message: analysisError });
 
     if (agentData.knowledge_base && !Array.isArray(agentData.knowledge_base)) {
       agentData.knowledge_base = [agentData.knowledge_base];
@@ -253,6 +277,8 @@ exports.updateAgent = async (req, res) => {
     if (updateData.tts_model && !elevenlabsService.allowedModels.includes(updateData.tts_model)) {
       return res.status(400).json({ success: false, message: 'This voice model is not available. Choose another one.' });
     }
+    const analysisError = await checkAnalysis(updateData.analysis, userId);
+    if (analysisError) return res.status(400).json({ success: false, message: analysisError });
 
     if (updateData.knowledge_base && !Array.isArray(updateData.knowledge_base)) {
       updateData.knowledge_base = [updateData.knowledge_base];

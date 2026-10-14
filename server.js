@@ -6,6 +6,9 @@ const { Server } = require('socket.io');
 const deleteExpiredOtp = require('./cron/deleteExpiredOtps');
 const { initTopUpExpiryCron } = require('./cron/topup-expiry.cron');
 const whatsappFlowSweeper = require('./cron/whatsappFlowSweeper');
+const outcomeSweeper = require('./cron/outcomeSweeper');
+const followUpSweeper = require('./cron/followUpSweeper');
+const outcomeDigest = require('./cron/outcomeDigest');
 
 const PORT = process.env.PORT || 3000;
 
@@ -35,6 +38,9 @@ const PORT = process.env.PORT || 3000;
     deleteExpiredOtp.start();
     initTopUpExpiryCron();
     whatsappFlowSweeper.start();
+    outcomeSweeper.start();
+    followUpSweeper.start();
+    outcomeDigest.start();
 
     app.set('io', io);
     require('./utils/realtime').attach(io);

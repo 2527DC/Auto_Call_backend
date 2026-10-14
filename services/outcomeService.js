@@ -13,6 +13,7 @@
 // person has set that status themselves.
 
 const { db } = require('../models');
+const UserSettings = require('../models/user-settings.model');
 const llmService = require('./llmService');
 const { presetSettings, PRESETS, STATUS_OUTCOME } = require('../utils/outcomePresets');
 const { cleanFieldValue } = require('../utils/fieldValue');
@@ -175,6 +176,14 @@ class OutcomeService {
     }
 
     // 4. The AI.
+    const ownerId = call.user_id?._id || call.user_id;
+    const userSettings = ownerId ? await UserSettings.findOne({ user: ownerId }).populate('ai_model') : null;
+    const aiConfig = userSettings?.ai_model ? {
+      model: userSettings.ai_model.model_id,
+      apiKey: userSettings.ai_api_key,
+      provider: userSettings.ai_model.provider
+    } : null;
+
     const fields = await this.fieldsFor(agent);
     const allowed = settings.outcomes.filter(o => !o.archived && (!o.system || o.key === 'needs_review'));
     const usage = newUsage();
@@ -193,7 +202,8 @@ class OutcomeService {
         duration: call.duration,
         when: new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' }).format(call.started_at || call.created_at)
       },
-      language: settings.summary_language || 'English'
+      language: settings.summary_language || 'English',
+      aiConfig
     }));
 
     if (!ai) {

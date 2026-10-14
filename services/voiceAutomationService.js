@@ -559,9 +559,6 @@ class VoiceAutomationService extends EventEmitter {
         if (!activeVoiceId && agent.voice_id) activeVoiceId = agent.voice_id;
       }
     }
-    if (activeVoiceId && activeVoiceId.startsWith('aura-2-')) {
-      activeVoiceId = activeVoiceId.replace(/^aura-2-/, 'aura-');
-    }
     return { activeProvider, activeVoiceId };
   }
 

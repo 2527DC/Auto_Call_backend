@@ -15,7 +15,7 @@ class DeepgramService {
     }
 
     try {
-      const model = (voiceId || 'aura-asteria-en').replace(/^aura-2-/, 'aura-');
+      const model = voiceId || 'aura-asteria-en';
       const sr = sampleRate || 16000;
       const response = await axios({
         method: 'POST',

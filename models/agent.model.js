@@ -169,6 +169,19 @@ const AgentSchema = new Schema(
       default: null,
       min: 0
     },
+    // After each call the AI writes a summary, picks the outcome and fills in
+    // the details to collect (a Lead Capture Form). See services/outcomeService.js.
+    analysis: {
+      enabled: { type: Boolean, default: true },
+      form_id: { type: Schema.Types.ObjectId, ref: 'Form', default: null },
+      // What counts as success for this agent's calls (else the client's default).
+      success_description: { type: String, default: '' },
+      extra_instructions: { type: String, default: '' },
+      // Who follows up at the due time: the client's default, the AI, the team, or nobody.
+      follow_up_mode: { type: String, enum: ['default', 'ai_call', 'team', 'off'], default: 'default' },
+      // A connected Google Sheet that gets one row per analysed call.
+      google_sheet_id: { type: Schema.Types.ObjectId, ref: 'GoogleSheet', default: null }
+    },
     // Outgoing calls: wait for the customer's "Hello?" before greeting, or greet
     // the moment the call connects. Incoming calls always greet at once.
     greeting_mode: {

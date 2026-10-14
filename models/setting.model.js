@@ -338,6 +338,25 @@ const SettingSchema = new Schema(
       type: Number,
       default: 1
     },
+    // Hours (India time) outgoing campaign, retry and follow-up calls may be placed.
+    calling_window_start: { type: Number, default: 10, min: 0, max: 23 },
+    calling_window_end: { type: Number, default: 21, min: 1, max: 24 },
+    // AI call outcomes: off, only on admins' own agents (to try it), or for everyone.
+    outcomes_mode: {
+      type: String,
+      enum: ['off', 'admin_only', 'all'],
+      default: 'off'
+    },
+    // When outcomes were first turned on: older calls aren't analysed automatically.
+    outcomes_enabled_at: {
+      type: Date,
+      default: null
+    },
+    // Credits charged per call analysed by the AI (0 = free).
+    credits_per_analysis: {
+      type: Number,
+      default: 0
+    },
     credits_per_minute: {
       type: Number,
       default: 1

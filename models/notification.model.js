@@ -24,6 +24,11 @@ const notificationSchema = new Schema(
         is_read : {
             type : Boolean,
             default : false
+        },
+        // What the notification is about, for a link (e.g. { call_id, contact_id }).
+        data : {
+            type : Schema.Types.Mixed,
+            default : {}
         }
     },
     {

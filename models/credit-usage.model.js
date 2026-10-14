@@ -11,7 +11,7 @@ const CreditUsageSchema = new Schema(
     },
     transaction_type: {
       type: String,
-      enum: ['registration_bonus', 'call_deduction', 'sms_deduction', 'whatsapp_deduction', 'manual_add', 'manual_deduct', 'purchase','bonus_credit'],
+      enum: ['registration_bonus', 'call_deduction', 'sms_deduction', 'whatsapp_deduction', 'analysis_deduction', 'manual_add', 'manual_deduct', 'purchase','bonus_credit'],
       required: true
     },
     credits: {

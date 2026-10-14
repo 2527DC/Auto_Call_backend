@@ -546,6 +546,14 @@ exports.getCampaignHistory = async (req, res) => {
     const avgDuration = completedCount > 0 ? Math.round(totalDuration / completedCount) : 0;
     const successRate = totalLeads > 0 ? Math.round((completedCount / totalLeads) * 100) : 0;
 
+    // How the calls ended up, by outcome (calls not analysed yet are left out).
+    const breakdown = {};
+    for (const c of calls) {
+      if (!c.outcome?.key) continue;
+      const b = breakdown[c.outcome.key] || (breakdown[c.outcome.key] = { key: c.outcome.key, label: c.outcome.label, result: c.outcome.result, reached: c.outcome.reached, count: 0 });
+      b.count++;
+    }
+
     res.status(200).json({
       success: true,
       data: {
@@ -562,6 +570,7 @@ exports.getCampaignHistory = async (req, res) => {
           avgDuration,
           successRate
         },
+        outcomes: Object.values(breakdown).sort((a, b) => b.count - a.count),
         calls: calls.map(c => ({
           _id: c._id,
           lead_name: c.lead_name,
@@ -572,7 +581,9 @@ exports.getCampaignHistory = async (req, res) => {
           ended_at: c.ended_at,
           fail_reason: c.fail_reason,
           recording_url: c.recording_url,
-          transcript: c.transcript
+          transcript: c.transcript,
+          contact_id: c.contact_id,
+          outcome: c.outcome?.key ? { key: c.outcome.key, label: c.outcome.label, result: c.outcome.result, reached: c.outcome.reached, summary: c.outcome.summary, source: c.outcome.source } : null
         }))
       }
     });

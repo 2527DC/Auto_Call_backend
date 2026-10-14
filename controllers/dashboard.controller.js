@@ -151,6 +151,44 @@ const getAdminTrends = async (query) => {
 };
 
 // One client's calls and campaigns for the user dashboard charts.
+// What the period's calls led to: a funnel (calls -> reached -> good -> goal
+// achieved), the commonest outcomes, and follow-ups due today or overdue.
+const getUserOutcomes = async (userId, query) => {
+  const period = buildPeriod(query.dateRange, query.startDate, query.endDate) || buildPeriod('this_year');
+  const current = between(period.start, new Date(Math.min(period.end.getTime(), Date.now())));
+  const istNow = new Date(Date.now() + 330 * 60000);
+  const todayStart = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate()) - 330 * 60000);
+  const todayEnd = new Date(todayStart.getTime() + 86400000);
+  const open = { $in: ['pending', 'in_progress'] };
+  const [funnel, byOutcome, dueToday, overdue] = await Promise.all([
+    Call.aggregate([
+      { $match: { user_id: userId, created_at: current } },
+      { $group: {
+        _id: null,
+        calls: { $sum: 1 },
+        analysed: { $sum: { $cond: [{ $ifNull: ['$outcome.key', false] }, 1, 0] } },
+        reached: { $sum: { $cond: [{ $eq: ['$outcome.reached', true] }, 1, 0] } },
+        good: { $sum: { $cond: [{ $and: [{ $eq: ['$outcome.reached', true] }, { $eq: ['$outcome.result', 'good'] }] }, 1, 0] } },
+        goal: { $sum: { $cond: [{ $eq: ['$outcome.key', 'goal_achieved'] }, 1, 0] } }
+      } }
+    ]),
+    Call.aggregate([
+      { $match: { user_id: userId, created_at: current, 'outcome.key': { $ne: null } } },
+      { $group: { _id: '$outcome.key', label: { $last: '$outcome.label' }, result: { $last: '$outcome.result' }, reached: { $last: '$outcome.reached' }, count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 8 }
+    ]),
+    db.FollowUp.countDocuments({ user_id: userId, status: open, due_at: { $gte: todayStart, $lt: todayEnd } }),
+    db.FollowUp.countDocuments({ user_id: userId, status: open, due_at: { $lt: todayStart } })
+  ]);
+  const f = funnel[0] || { calls: 0, analysed: 0, reached: 0, good: 0, goal: 0 };
+  return {
+    funnel: { calls: f.calls, analysed: f.analysed, reached: f.reached, good: f.good, goal_achieved: f.goal },
+    top: byOutcome.map(o => ({ key: o._id, label: o.label, result: o.result, reached: o.reached !== false, count: o.count })),
+    follow_ups: { due_today: dueToday, overdue }
+  };
+};
+
 const getUserTrends = async (userId, query) => {
   const period = buildPeriod(query.dateRange, query.startDate, query.endDate) || buildPeriod('this_year');
   const current = between(period.start, new Date(Math.min(period.end.getTime(), Date.now())));
@@ -690,6 +728,7 @@ exports.getUserDashboardData = async (req, res) => {
 
     const creditStats = await creditService.getCreditStatistics(userId);
     const trends = await getUserTrends(userId, req.query);
+    const outcomes = await getUserOutcomes(userId, req.query);
 
     res.json({
       success: true,
@@ -721,7 +760,8 @@ exports.getUserDashboardData = async (req, res) => {
           recentActivity
         },
         credits: creditStats,
-        trends
+        trends,
+        outcomes
       }
     });
   } catch (error) {

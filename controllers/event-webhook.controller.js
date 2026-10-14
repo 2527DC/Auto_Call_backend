@@ -5,7 +5,7 @@ const EventWebhook = db.EventWebhook;
 
 exports.createWebhook = async (req, res) => {
   try {
-    const { name, endpoint_url, events, is_active } = req.body;
+    const { name, endpoint_url, events, is_active, include_transcript } = req.body;
     
     if (!name || !endpoint_url || !events || !Array.isArray(events) || events.length === 0) {
       return res.status(400).json({ success: false, message: 'Name, endpoint_url, and events array are required.' });
@@ -16,7 +16,8 @@ exports.createWebhook = async (req, res) => {
       name,
       endpoint_url,
       events,
-      is_active: is_active !== undefined ? is_active : true
+      is_active: is_active !== undefined ? is_active : true,
+      include_transcript: include_transcript === true
     });
 
     res.status(201).json({ success: true, message: 'Webhook created successfully.', data: newWebhook });
@@ -79,7 +80,7 @@ exports.getWebhookById = async (req, res) => {
 
 exports.updateWebhook = async (req, res) => {
   try {
-    const { name, endpoint_url, events, is_active } = req.body;
+    const { name, endpoint_url, events, is_active, include_transcript } = req.body;
     const webhook = await EventWebhook.findOne({ _id: req.params.id, user_id: req.user._id || req.user.id });
 
     if (!webhook) {
@@ -90,6 +91,8 @@ exports.updateWebhook = async (req, res) => {
     if (endpoint_url) webhook.endpoint_url = endpoint_url;
     if (events && Array.isArray(events) && events.length > 0) webhook.events = events;
     if (is_active !== undefined) webhook.is_active = is_active;
+    if (include_transcript !== undefined) webhook.include_transcript = include_transcript === true;
+    if (!webhook.secret) webhook.secret = EventWebhook.newSecret();
 
     await webhook.save();
 
@@ -110,6 +113,22 @@ exports.deleteWebhook = async (req, res) => {
     res.status(200).json({ success: true, message: 'Webhook deleted successfully' });
   } catch (error) {
     console.error('Error deleting webhook:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// A new signing secret (the old one stops working at once).
+exports.rotateSecret = async (req, res) => {
+  try {
+    const webhook = await EventWebhook.findOne({ _id: req.params.id, user_id: req.user._id || req.user.id });
+    if (!webhook) {
+      return res.status(404).json({ success: false, message: 'Webhook not found' });
+    }
+    webhook.secret = EventWebhook.newSecret();
+    await webhook.save();
+    res.status(200).json({ success: true, message: 'New signing secret created', data: { secret: webhook.secret } });
+  } catch (error) {
+    console.error('Error rotating webhook secret:', error);
     res.status(500).json({ success: false, message: error.message });
   }
 };

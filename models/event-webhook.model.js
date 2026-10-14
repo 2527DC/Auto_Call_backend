@@ -1,6 +1,9 @@
 'use strict';
 
+const crypto = require('crypto');
 const mongoose = require('mongoose');
+
+const newSecret = () => `whsec_${crypto.randomBytes(24).toString('hex')}`;
 
 const EventWebhookSchema = new mongoose.Schema(
   {
@@ -44,12 +47,26 @@ const EventWebhookSchema = new mongoose.Schema(
         'Campaign Aborted',
         'Flow Initiated',
         'Flow Finished',
-        'Flow Errored'
+        'Flow Errored',
+        'Call Analyzed',
+        'Lead Status Changed',
+        'Follow-up Due'
       ]
     }],
     is_active: {
       type: Boolean,
       default: true
+    },
+    // Signs every delivery (X-Voxeno-Signature), so the receiver can check it came from us.
+    // Set on save, not as a default: a default would be filled in (unsaved, and
+    // different each time) whenever a webhook saved before signing is loaded.
+    secret: {
+      type: String
+    },
+    // Call transcripts are personal data: sent only to webhooks that ask for them.
+    include_transcript: {
+      type: Boolean,
+      default: false
     }
   },
   {
@@ -68,5 +85,11 @@ EventWebhookSchema.virtual('id').get(function() {
 EventWebhookSchema.set('toJSON', {
   virtuals: true
 });
+
+EventWebhookSchema.pre('save', function () {
+  if (!this.secret) this.secret = newSecret();
+});
+
+EventWebhookSchema.statics.newSecret = newSecret;
 
 module.exports = mongoose.model('EventWebhook', EventWebhookSchema);

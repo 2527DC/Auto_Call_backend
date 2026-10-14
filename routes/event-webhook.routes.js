@@ -13,5 +13,6 @@ router.get('/', checkPermission('view.webhooks'), eventWebhookController.getWebh
 router.get('/:id', checkPermission('view.webhooks'), eventWebhookController.getWebhookById);
 router.put('/:id', checkPermission('update.webhooks'), eventWebhookController.updateWebhook);
 router.delete('/:id', checkPermission('delete.webhooks'), eventWebhookController.deleteWebhook);
+router.post('/:id/secret', checkPermission('update.webhooks'), eventWebhookController.rotateSecret);
 
 module.exports = router;

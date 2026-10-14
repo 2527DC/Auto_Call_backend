@@ -123,10 +123,35 @@ exports.getFormResponses = async (req, res) => {
     const sortOptions = {};
     sortOptions[sortBy] = sortOrder === 'desc' ? -1 : 1;
     const responses = await FormResponse.find({ form_id: req.params.id, user_id: req.user._id })
-      .populate('call_id')
+      .populate('call_id', 'from_number to_number direction status duration created_at recording_url outcome.key outcome.label outcome.summary lead_name contact_id')
+      .populate('contact_id', 'first_name last_name phone_number')
       .sort(sortOptions);
 
     return res.status(200).json({ success: true, data: responses });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+// A form's responses as a CSV: one column per field, plus who answered and when.
+exports.exportFormResponses = async (req, res) => {
+  try {
+    const { toCsv, istDateTime } = require('../utils/csv');
+    const form = await Form.findOne({ _id: req.params.id, user_id: req.user._id }).lean();
+    if (!form) return res.status(404).json({ success: false, message: 'Form not found' });
+    const responses = await FormResponse.find({ form_id: form._id, user_id: req.user._id })
+      .populate('call_id', 'from_number to_number direction')
+      .populate('contact_id', 'first_name last_name')
+      .sort({ created_at: -1 })
+      .limit(10000)
+      .lean();
+    const rows = [['Date (IST)', 'Name', 'Phone', 'Status', ...form.fields.map(f => f.label)]];
+    for (const r of responses) {
+      const phone = r.phone || (r.call_id ? (r.call_id.direction === 'inbound' ? r.call_id.from_number : r.call_id.to_number) : '');
+      rows.push([istDateTime(r.created_at), [r.contact_id?.first_name, r.contact_id?.last_name].filter(Boolean).join(' '), phone, r.status, ...form.fields.map(f => r.responses?.[f.key])]);
+    }
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="form-responses-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send(toCsv(rows));
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }

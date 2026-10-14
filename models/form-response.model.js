@@ -24,6 +24,12 @@ const FormResponseSchema = new Schema(
       ref: 'Flow',
       default: null
     },
+    // Who answered, and on which call: so responses can be listed and exported.
+    contact_id: { type: Schema.Types.ObjectId, ref: 'Contact', default: null },
+    phone: { type: String, default: null },
+    agent_id: { type: Schema.Types.ObjectId, ref: 'Agent', default: null },
+    campaign_id: { type: Schema.Types.ObjectId, ref: 'Campaign', default: null },
+    direction: { type: String, default: null },
     responses: {
       type: Schema.Types.Mixed,
       default: {}

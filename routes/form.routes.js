@@ -14,5 +14,6 @@ router.get('/:id', checkPermission('view.forms'), formController.getForm);
 router.put('/:id', checkPermission('update.forms'), formController.updateForm);
 router.delete('/delete', checkPermission('delete.forms'), formController.deleteForm);
 router.get('/:id/responses', checkPermission('view.forms'), formController.getFormResponses);
+router.get('/:id/responses/export', checkPermission('view.forms'), formController.exportFormResponses);
 
 module.exports = router;

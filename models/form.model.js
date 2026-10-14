@@ -21,8 +21,18 @@ const FormFieldSchema = new Schema({
   },
   type: {
     type: String,
-    enum: ['text', 'number', 'date', 'time', 'email'],
+    enum: ['text', 'number', 'date', 'time', 'email', 'phone', 'yes_no', 'choice'],
     default: 'text'
+  },
+  // Allowed answers for a 'choice' field.
+  options: {
+    type: [String],
+    default: undefined
+  },
+  // Extra guidance for the AI that reads the answer (e.g. "in lakhs").
+  hint: {
+    type: String,
+    default: ''
   }
 }, { _id: true });
 

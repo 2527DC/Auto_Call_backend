@@ -497,13 +497,24 @@ exports.addBonusCredits = async (req, res) => {
 // ElevenLabs / Deepgram / Sarvam accounts, so each provider shows that client's
 // usage per key. Calls use them instead of Voxeno's platform keys. Only the last
 // 4 characters are ever sent back.
-const PROVIDER_KEY_FIELDS = ['elevenlabs_api_key', 'deepgram_api_key', 'sarvam_ai_api_key'];
-const maskKey = (val) => (val ? `${'*'.repeat(Math.max(val.length - 4, 0))}${val.slice(-4)}` : '');
+const PROVIDER_KEY_FIELDS = [
+  'elevenlabs_api_key',
+  'deepgram_api_key',
+  'sarvam_ai_api_key',
+  'plivo_auth_id',
+  'plivo_auth_token',
+  'plivo_app_id',
+];
+const maskKey = (val, field) => {
+  if (!val) return '';
+  if (field === 'plivo_auth_id' || field === 'plivo_app_id') return val;
+  return `${'*'.repeat(Math.max(val.length - 4, 0))}${val.slice(-4)}`;
+};
 
 exports.getProviderKeys = async (req, res) => {
   try {
     const settings = await UserSettings.findOne({ user: req.params.id }).select(PROVIDER_KEY_FIELDS.join(' ')).lean();
-    const data = Object.fromEntries(PROVIDER_KEY_FIELDS.map((field) => [field, maskKey(settings?.[field])]));
+    const data = Object.fromEntries(PROVIDER_KEY_FIELDS.map((field) => [field, maskKey(settings?.[field], field)]));
     return res.status(200).json({ success: true, data });
   } catch (error) {
     console.error('Get Provider Keys Error:', error);

@@ -168,6 +168,13 @@ exports.syncPhoneNumberToElevenLabs = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Phone number already synced to ElevenLabs' });
     }
 
+    if (phoneNumber.provider === 'plivo') {
+      return res.status(400).json({
+        success: false,
+        message: 'Plivo numbers connect directly to Voxeno voice engine and do not require ElevenLabs number sync.'
+      });
+    }
+
     const settings = await UserSettings.findOne({ user: req.user.id });
     if (!settings || !settings.elevenlabs_api_key) {
       return res.status(400).json({ success: false, message: 'ElevenLabs API key not configured in your settings' });

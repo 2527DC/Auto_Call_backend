@@ -186,6 +186,9 @@ exports.getVoiceModels = async (req, res) => {
 exports.getVoicePreview = async (req, res) => {
   try {
     const { voice_id } = req.params;
+    const requestedLang = (req.query.lang || req.query.language || 'en').toLowerCase().trim();
+    const lang = ['en', 'hi', 'kn'].includes(requestedLang) ? requestedLang : 'en';
+
     if (!voice_id) {
       return res.status(400).json({ success: false, message: 'voice_id is required' });
     }
@@ -193,14 +196,22 @@ exports.getVoicePreview = async (req, res) => {
     const uploadDir = path.join(__dirname, '../uploads/previews');
     await fs.ensureDir(uploadDir);
 
-    const filePathWav = path.join(uploadDir, `${voice_id}.wav`);
-    const filePathMp3 = path.join(uploadDir, `${voice_id}.mp3`);
+    const filePathWav = path.join(uploadDir, `${voice_id}_${lang}.wav`);
+    const filePathMp3 = path.join(uploadDir, `${voice_id}_${lang}.mp3`);
+    const legacyWav = path.join(uploadDir, `${voice_id}.wav`);
+    const legacyMp3 = path.join(uploadDir, `${voice_id}.mp3`);
 
     if (await fs.pathExists(filePathWav)) {
       return res.sendFile(filePathWav);
     }
     if (await fs.pathExists(filePathMp3)) {
       return res.sendFile(filePathMp3);
+    }
+    if (lang === 'en' && await fs.pathExists(legacyWav)) {
+      return res.sendFile(legacyWav);
+    }
+    if (lang === 'en' && await fs.pathExists(legacyMp3)) {
+      return res.sendFile(legacyMp3);
     }
 
     let voice = await Voice.findOne({ voice_id });
@@ -218,13 +229,24 @@ exports.getVoicePreview = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Voice not found' });
     }
 
-    if (voice.preview_url && (voice.preview_url.startsWith('http://') || voice.preview_url.startsWith('https://')) && !voice.preview_url.includes('/api/voices/') && voice.provider !== 'sarvam_ai') {
+    // If English requested and voice has an external static preview URL, redirect to it
+    if (lang === 'en' && voice.preview_url && (voice.preview_url.startsWith('http://') || voice.preview_url.startsWith('https://')) && !voice.preview_url.includes('/api/voices/') && voice.provider !== 'sarvam_ai') {
       return res.redirect(voice.preview_url);
     }
 
     // Previews are made with platform or admin keys, then cached on disk.
-    const cleanName = (voice.name || voice_id).replace(/\s*\(.*\)/, '').trim();
-    const sampleText = `Hello, I am ${cleanName}, your AI conversational voice assistant.`;
+    const cleanName = (voice.name || voice_id)
+      .replace(/\s*\(.*\)/, '')
+      .replace(/[-_]/g, ' ')
+      .trim();
+
+    const SAMPLE_TEXTS = {
+      en: `Hello, I am ${cleanName}, your AI conversational voice assistant. How can I help you today?`,
+      hi: `नमस्ते, मैं ${cleanName} हूँ, आपका AI वॉयಸ असिस्टेंट। मैं आज आपकी क्या मदद कर सकता हूँ?`,
+      kn: `ನಮಸ್ಕಾರ, ನಾನು ${cleanName}, ನಿಮ್ಮ AI ಧ್ವನಿ ಸಹಾಯಕ. ನಾನು ಇಂದು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?`,
+    };
+
+    const sampleText = SAMPLE_TEXTS[lang] || SAMPLE_TEXTS.en;
 
     if (voice.provider === 'sarvam_ai') {
       let activeKey = sarvamService.apiKey;
@@ -239,7 +261,14 @@ exports.getVoicePreview = async (req, res) => {
       if (!activeKey) {
         return res.status(400).json({ success: false, message: 'Sarvam AI API key is not configured. Please add it under System Settings -> AI Configuration.' });
       }
-      const pcmBuffer = await sarvamService.generateSpeech(sampleText, voice_id, { target_language_code: 'en-IN' }, activeKey, 16000);
+
+      const sarvamLangMap = {
+        kn: 'kn-IN',
+        hi: 'hi-IN',
+        en: 'en-IN'
+      };
+      const targetLang = sarvamLangMap[lang] || 'en-IN';
+      const pcmBuffer = await sarvamService.generateSpeech(sampleText, voice_id, { target_language_code: targetLang }, activeKey, 16000);
       const wavBuffer = sarvamService.wrapPcmInWav(pcmBuffer, pcmBuffer.sampleRate || 16000);
       await fs.writeFile(filePathWav, wavBuffer);
       return res.sendFile(filePathWav);
@@ -253,7 +282,7 @@ exports.getVoicePreview = async (req, res) => {
         const anyUser = await UserSettings.findOne({ deepgram_api_key: { $ne: null } }).select('deepgram_api_key').lean();
         activeKey = anyUser?.deepgram_api_key;
       }
-      const audioBuffer = await deepgramService.generateSpeech(sampleText, voice_id, {}, activeKey, 16000);
+      const audioBuffer = await deepgramService.generateSpeech(SAMPLE_TEXTS.en, voice_id, {}, activeKey, 16000);
       const wavBuffer = deepgramService.wrapPcmInWav(audioBuffer, 16000);
       await fs.writeFile(filePathWav, wavBuffer);
       return res.sendFile(filePathWav);
@@ -267,8 +296,8 @@ exports.getVoicePreview = async (req, res) => {
         const anyUser = await UserSettings.findOne({ elevenlabs_api_key: { $ne: null } }).select('elevenlabs_api_key').lean();
         activeKey = anyUser?.elevenlabs_api_key;
       }
-      const audioBuffer = await elevenlabsService.generateSpeech(sampleText, voice_id, {}, activeKey);
-      const wavBuffer = elevenlabsService.wrapPcmInWav(audioBuffer);
+      const audioBuffer = await elevenlabsService.generateSpeech(sampleText, voice_id, { language: lang, model: 'eleven_multilingual_v2' }, activeKey);
+      const wavBuffer = elevenlabsService.wrapPcmInWav(audioBuffer, 16000);
       await fs.writeFile(filePathWav, wavBuffer);
       return res.sendFile(filePathWav);
     }

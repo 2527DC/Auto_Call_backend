@@ -158,14 +158,24 @@ class SarvamService {
   // Sarvam has no voice-list API; these are Bulbul v3's speakers. Each speaks
   // all of Bulbul's languages (Indian English, Hindi, Kannada and more).
   async fetchVoices(apiKey = null) {
-    return BULBUL_V3_SPEAKERS.map((id) => ({
-      name: `${id.charAt(0).toUpperCase()}${id.slice(1)} (Sarvam AI)`,
-      voice_id: id,
-      category: 'Predefined',
-      provider: 'sarvam_ai',
-      preview_url: null,
-      labels: { gender: null, age: null, accent: 'Indian', description: 'Bulbul v3 voice' }
-    }));
+    const femaleSpeakers = ['ritu', 'priya', 'neha', 'pooja', 'simran', 'kavya', 'ishita', 'shreya', 'roopa', 'tanya', 'shruti', 'suhani', 'kavitha', 'rupali', 'meera', 'divya', 'anushka', 'manisha', 'vidya', 'arya', 'pavithra'];
+
+    return BULBUL_V3_SPEAKERS.map((id) => {
+      const isFemale = femaleSpeakers.includes(id.toLowerCase());
+      return {
+        name: `${id.charAt(0).toUpperCase()}${id.slice(1)} (Sarvam AI)`,
+        voice_id: id,
+        category: 'Predefined',
+        provider: 'sarvam_ai',
+        preview_url: null,
+        labels: {
+          gender: isFemale ? 'Female' : 'Male',
+          age: 'Young',
+          accent: 'Indian',
+          description: 'Bulbul v3 voice'
+        }
+      };
+    });
   }
 }
 

@@ -1,6 +1,7 @@
 const Voice = require('../models/voice.model');
 const { db } = require('../models');
 const UserSettings = db.UserSettings;
+const Setting = db.Setting;
 const elevenlabsService = require('../services/elevenlabsService');
 const deepgramService = require('../services/deepgramService');
 const sarvamService = require('../services/sarvamService');
@@ -222,22 +223,52 @@ exports.getVoicePreview = async (req, res) => {
       return res.redirect(voice.preview_url);
     }
 
-    // Previews are made with Voxeno's own keys, then kept on disk.
+    // Previews are made with platform or admin keys, then cached on disk.
     const cleanName = (voice.name || voice_id).replace(/\s*\(.*\)/, '').trim();
     const sampleText = `Hello, I am ${cleanName}, your AI conversational voice assistant.`;
 
     if (voice.provider === 'sarvam_ai') {
-      const pcmBuffer = await sarvamService.generateSpeech(sampleText, voice_id, {}, sarvamService.apiKey, 16000);
+      let activeKey = sarvamService.apiKey;
+      if (!activeKey) {
+        const platformSetting = await Setting.findOne().select('sarvam_ai_api_key').lean();
+        activeKey = platformSetting?.sarvam_ai_api_key;
+      }
+      if (!activeKey) {
+        const anyUser = await UserSettings.findOne({ sarvam_ai_api_key: { $ne: null } }).select('sarvam_ai_api_key').lean();
+        activeKey = anyUser?.sarvam_ai_api_key;
+      }
+      if (!activeKey) {
+        return res.status(400).json({ success: false, message: 'Sarvam AI API key is not configured. Please add it under System Settings -> AI Configuration.' });
+      }
+      const pcmBuffer = await sarvamService.generateSpeech(sampleText, voice_id, { target_language_code: 'en-IN' }, activeKey, 16000);
       const wavBuffer = sarvamService.wrapPcmInWav(pcmBuffer, pcmBuffer.sampleRate || 16000);
       await fs.writeFile(filePathWav, wavBuffer);
       return res.sendFile(filePathWav);
     } else if (voice.provider === 'deepgram') {
-      const audioBuffer = await deepgramService.generateSpeech(sampleText, voice_id, {}, deepgramService.apiKey, 16000);
+      let activeKey = deepgramService.apiKey;
+      if (!activeKey) {
+        const platformSetting = await Setting.findOne().select('deepgram_api_key').lean();
+        activeKey = platformSetting?.deepgram_api_key;
+      }
+      if (!activeKey) {
+        const anyUser = await UserSettings.findOne({ deepgram_api_key: { $ne: null } }).select('deepgram_api_key').lean();
+        activeKey = anyUser?.deepgram_api_key;
+      }
+      const audioBuffer = await deepgramService.generateSpeech(sampleText, voice_id, {}, activeKey, 16000);
       const wavBuffer = deepgramService.wrapPcmInWav(audioBuffer, 16000);
       await fs.writeFile(filePathWav, wavBuffer);
       return res.sendFile(filePathWav);
     } else {
-      const audioBuffer = await elevenlabsService.generateSpeech(sampleText, voice_id, {}, elevenlabsService.apiKey);
+      let activeKey = elevenlabsService.apiKey;
+      if (!activeKey) {
+        const platformSetting = await Setting.findOne().select('elevenlabs_api_key').lean();
+        activeKey = platformSetting?.elevenlabs_api_key;
+      }
+      if (!activeKey) {
+        const anyUser = await UserSettings.findOne({ elevenlabs_api_key: { $ne: null } }).select('elevenlabs_api_key').lean();
+        activeKey = anyUser?.elevenlabs_api_key;
+      }
+      const audioBuffer = await elevenlabsService.generateSpeech(sampleText, voice_id, {}, activeKey);
       const wavBuffer = elevenlabsService.wrapPcmInWav(audioBuffer);
       await fs.writeFile(filePathWav, wavBuffer);
       return res.sendFile(filePathWav);

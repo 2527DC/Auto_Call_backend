@@ -28,7 +28,7 @@ class SarvamService {
     try {
       const requested = String(voiceId || 'shubh').toLowerCase();
       const speaker = LEGACY_SPEAKERS[requested] || (BULBUL_V3_SPEAKERS.includes(requested) ? requested : 'shubh');
-      const targetLang = voiceSettings.target_language_code || voiceSettings.language || 'hi-IN';
+      const targetLang = voiceSettings.target_language_code || voiceSettings.language || (text.match(/[\u0900-\u0D7F]/) ? 'hi-IN' : 'en-IN');
 
       const response = await axios({
         method: 'POST',
@@ -36,6 +36,7 @@ class SarvamService {
         data: {
           text: text.slice(0, 2500),
           target_language_code: targetLang,
+          language_code: targetLang,
           speaker: speaker,
           model: 'bulbul:v3',
           speech_sample_rate: sampleRate || 16000

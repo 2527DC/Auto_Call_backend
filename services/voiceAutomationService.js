@@ -1605,10 +1605,14 @@ class VoiceAutomationService extends EventEmitter {
             }).catch(err => console.error('[Voice] Speak chunk error:', err.message));
           };
 
+          const modelUsed = aiConfig?.model || currentAgent.llm_model?.model_id || 'gpt-4o-mini';
+          const providerUsed = currentAgent.llm_model?.provider || 'openai';
+          recordUsage({ llm_provider: providerUsed, llm_model: modelUsed });
+
           const rawResponse = await llmService.streamResponseWithSystemPrompt({
             prompt: fullPrompt,
             systemPrompt,
-            model: aiConfig?.model || currentAgent.llm_model?.model_id,
+            model: modelUsed,
             aiConfig,
             agentConfig: {
               empathy_level: currentAgent.empathy_level,
@@ -1772,7 +1776,7 @@ class VoiceAutomationService extends EventEmitter {
           await this.waitForGreetingTurn(stream);
           return await this.speakViaTwiml(streamSid, text);
         }
-        recordUsage({ tts_provider: activeProvider, tts_characters: text.length });
+        recordUsage({ tts_provider: activeProvider, tts_voice: voiceId, tts_model: model, tts_characters: text.length });
         ttsCache.set(cacheKey, base64Audio, { persist: isGreeting });
       }
 

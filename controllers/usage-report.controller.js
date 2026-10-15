@@ -1,7 +1,7 @@
 'use strict';
 
 const { db } = require('../models');
-const { Call, User, CreditUsage, PaymentHistory, Plan, Role, Setting, SMSLog, SmsMessage, WhatsAppLog } = db;
+const { Call, User, CreditUsage, PaymentHistory, Plan, Role, Setting, SMSLog, SmsMessage, WhatsAppLog, AIModel } = db;
 
 const { callCost, typicalMinuteCost } = require('../utils/callCost');
 const creditService = require('../services/creditService');
@@ -271,3 +271,307 @@ exports.getCreditCost = async (req, res) => {
     res.status(500).json({ success: false, message: 'Failed to work out the credit cost' });
   }
 };
+
+const getModelPricing = (modelId, rates) => {
+  const baseIn = rates?.cost_llm_input_per_1m_tokens || 14.55;
+  const baseOut = rates?.cost_llm_output_per_1m_tokens || 58.2;
+  const id = (modelId || '').toLowerCase();
+  if (id.includes('gpt-4o-mini')) return { inputPer1M: baseIn, outputPer1M: baseOut };
+  if (id.includes('gpt-4o') || id.includes('gpt-4-turbo')) return { inputPer1M: 215, outputPer1M: 860 };
+  if (id.includes('claude-3-5-sonnet')) return { inputPer1M: 260, outputPer1M: 1300 };
+  if (id.includes('claude-3-haiku')) return { inputPer1M: 22, outputPer1M: 110 };
+  return { inputPer1M: baseIn, outputPer1M: baseOut };
+};
+
+// GET /api/usage-report/ai-insights?from=YYYY-MM-DD&to=YYYY-MM-DD&user_id=...&model=...
+exports.getAiInsights = async (req, res) => {
+  try {
+    if (!isAdminRequest(req)) {
+      return res.status(403).json({ success: false, message: 'Only admins can view AI insights' });
+    }
+
+    const now = new Date();
+    // Default to last 30 days if from is not passed
+    const from = req.query.from ? new Date(`${req.query.from}T00:00:00`) : new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const to = req.query.to ? new Date(`${req.query.to}T23:59:59.999`) : now;
+
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) {
+      return res.status(400).json({ success: false, message: 'Invalid date range' });
+    }
+
+    const filter = {
+      created_at: { $gte: from, $lte: to }
+    };
+
+    if (req.query.user_id && req.query.user_id !== 'all') {
+      filter.user_id = req.query.user_id;
+    }
+
+    const rates = (await Setting.findOne()) || {};
+    const calls = await Call.find(filter)
+      .select('user_id agent_id duration usage credits_used created_at')
+      .populate('user_id', 'name email')
+      .populate({
+        path: 'agent_id',
+        select: 'name voice_provider llm_model',
+        populate: { path: 'llm_model', select: 'name display_name provider model_id' }
+      })
+      .sort({ created_at: -1 })
+      .lean();
+
+    const selectedModel = req.query.model && req.query.model !== 'all' ? req.query.model : null;
+
+    let totalCost = 0;
+    let totalTokens = 0;
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let totalSttSeconds = 0;
+    let totalTtsChars = 0;
+    let totalAiCalls = 0;
+    let costLlm = 0;
+    let costStt = 0;
+    let costTts = 0;
+
+    const modelsMap = new Map();
+    const providersMap = {
+      openai: { provider: 'OpenAI', service: 'LLM (Intelligence)', usage_label: 'Tokens', usage_value: 0, cost: 0 },
+      deepgram: { provider: 'Deepgram', service: 'STT & TTS (Voice Engine)', usage_label: 'Minutes / Chars', usage_value: 0, cost: 0 },
+      sarvam_ai: { provider: 'Sarvam AI', service: 'Indic STT / TTS', usage_label: 'Minutes / Chars', usage_value: 0, cost: 0 },
+      elevenlabs: { provider: 'ElevenLabs', service: 'High-Fidelity TTS', usage_label: 'Characters', usage_value: 0, cost: 0 },
+    };
+    const clientsMap = new Map();
+    const timelineMap = new Map();
+    const recentCalls = [];
+
+    // Pre-populate timeline with all days in range for smooth charts
+    const dayMs = 24 * 60 * 60 * 1000;
+    for (let d = new Date(from); d <= to; d = new Date(d.getTime() + dayMs)) {
+      const dayKey = d.toISOString().slice(0, 10);
+      timelineMap.set(dayKey, { date: dayKey, tokens: 0, input_tokens: 0, output_tokens: 0, cost: 0, calls: 0 });
+    }
+
+    const discoveredModels = new Set();
+
+    for (const call of calls) {
+      const rawModel = call.usage?.llm_model || call.agent_id?.llm_model?.model_id || 'gpt-4o-mini';
+      discoveredModels.add(rawModel);
+
+      // Model filter
+      if (selectedModel && rawModel !== selectedModel) {
+        continue;
+      }
+
+      const llmProvider = call.usage?.llm_provider || call.agent_id?.llm_model?.provider || 'openai';
+      const sttProvider = call.usage?.stt_provider || call.agent_id?.voice_provider || 'deepgram';
+      const ttsProvider = call.usage?.tts_provider || call.agent_id?.voice_provider || 'deepgram';
+
+      const inTokens = call.usage?.llm_input_tokens || 0;
+      const outTokens = call.usage?.llm_output_tokens || 0;
+      const callTokens = inTokens + outTokens;
+      const sttSec = call.usage?.stt_seconds || 0;
+      const ttsChars = call.usage?.tts_characters || 0;
+
+      const pricing = getModelPricing(rawModel, rates);
+      const callLlmCost = (inTokens / 1e6) * pricing.inputPer1M + (outTokens / 1e6) * pricing.outputPer1M;
+
+      const sttRate = rates[`cost_stt_per_minute_${sttProvider}`] || (sttProvider === 'sarvam_ai' ? 0.5 : 0.42);
+      const callSttCost = (sttSec / 60) * sttRate;
+
+      const ttsRate = (rates[`cost_tts_per_1k_chars_${ttsProvider}`] || (ttsProvider === 'elevenlabs' ? 3.88 : (ttsProvider === 'sarvam_ai' ? 3.0 : 1.46))) / 1000;
+      const callTtsCost = ttsChars * ttsRate;
+
+      const callTotalAiCost = callLlmCost + callSttCost + callTtsCost;
+
+      totalCost += callTotalAiCost;
+      totalTokens += callTokens;
+      totalInputTokens += inTokens;
+      totalOutputTokens += outTokens;
+      totalSttSeconds += sttSec;
+      totalTtsChars += ttsChars;
+      totalAiCalls += 1;
+      costLlm += callLlmCost;
+      costStt += callSttCost;
+      costTts += callTtsCost;
+
+      // Model breakdown
+      if (!modelsMap.has(rawModel)) {
+        modelsMap.set(rawModel, {
+          model_id: rawModel,
+          provider: llmProvider,
+          calls_count: 0,
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+          cost: 0,
+        });
+      }
+      const mRow = modelsMap.get(rawModel);
+      mRow.calls_count += 1;
+      mRow.input_tokens += inTokens;
+      mRow.output_tokens += outTokens;
+      mRow.total_tokens += callTokens;
+      mRow.cost += callLlmCost;
+
+      // Provider breakdown
+      const normLlmProv = (llmProvider || 'openai').toLowerCase();
+      if (!providersMap[normLlmProv]) {
+        providersMap[normLlmProv] = { provider: llmProvider, service: 'LLM', usage_label: 'Tokens', usage_value: 0, cost: 0 };
+      }
+      providersMap[normLlmProv].usage_value += callTokens;
+      providersMap[normLlmProv].cost += callLlmCost;
+
+      const normSttProv = (sttProvider || 'deepgram').toLowerCase();
+      if (providersMap[normSttProv]) {
+        providersMap[normSttProv].cost += callSttCost;
+      }
+      const normTtsProv = (ttsProvider || 'deepgram').toLowerCase();
+      if (providersMap[normTtsProv]) {
+        providersMap[normTtsProv].cost += callTtsCost;
+        if (normTtsProv === 'elevenlabs') {
+          providersMap[normTtsProv].usage_value += ttsChars;
+        }
+      }
+
+      // Timeline breakdown
+      const callDay = (call.created_at ? new Date(call.created_at) : new Date()).toISOString().slice(0, 10);
+      if (!timelineMap.has(callDay)) {
+        timelineMap.set(callDay, { date: callDay, tokens: 0, input_tokens: 0, output_tokens: 0, cost: 0, calls: 0 });
+      }
+      const tRow = timelineMap.get(callDay);
+      tRow.tokens += callTokens;
+      tRow.input_tokens += inTokens;
+      tRow.output_tokens += outTokens;
+      tRow.cost += callTotalAiCost;
+      tRow.calls += 1;
+
+      // Client breakdown
+      const userId = call.user_id ? String(call.user_id._id || call.user_id) : 'unknown';
+      if (!clientsMap.has(userId)) {
+        clientsMap.set(userId, {
+          user_id: userId,
+          name: call.user_id?.name || 'Unknown Client',
+          email: call.user_id?.email || '',
+          calls_count: 0,
+          total_tokens: 0,
+          input_tokens: 0,
+          output_tokens: 0,
+          stt_minutes: 0,
+          tts_characters: 0,
+          cost: 0,
+        });
+      }
+      const cRow = clientsMap.get(userId);
+      cRow.calls_count += 1;
+      cRow.total_tokens += callTokens;
+      cRow.input_tokens += inTokens;
+      cRow.output_tokens += outTokens;
+      cRow.stt_minutes += sttSec / 60;
+      cRow.tts_characters += ttsChars;
+      cRow.cost += callTotalAiCost;
+
+      // Recent calls (up to 50)
+      if (recentCalls.length < 50) {
+        recentCalls.push({
+          id: String(call._id),
+          created_at: call.created_at,
+          user: {
+            id: userId,
+            name: call.user_id?.name || 'Unknown Client',
+            email: call.user_id?.email || '',
+          },
+          agent: {
+            id: call.agent_id ? String(call.agent_id._id || call.agent_id) : null,
+            name: call.agent_id?.name || 'Direct / Flow Call',
+          },
+          duration: call.duration || 0,
+          model: rawModel,
+          provider: llmProvider,
+          input_tokens: inTokens,
+          output_tokens: outTokens,
+          total_tokens: callTokens,
+          stt_provider: sttProvider,
+          tts_provider: ttsProvider,
+          stt_seconds: round2(sttSec),
+          tts_characters: ttsChars,
+          cost: round2(callTotalAiCost),
+        });
+      }
+    }
+
+    // Format models array with percentages
+    const models = Array.from(modelsMap.values()).map((m) => ({
+      ...m,
+      cost: round2(m.cost),
+      tokens_percentage: totalTokens > 0 ? round2((m.total_tokens / totalTokens) * 100) : 0,
+      cost_percentage: totalCost > 0 ? round2((m.cost / totalCost) * 100) : 0,
+    })).sort((a, b) => b.total_tokens - a.total_tokens);
+
+    // Format providers array
+    const providers = Object.values(providersMap).map((p) => ({
+      ...p,
+      cost: round2(p.cost),
+      percentage: totalCost > 0 ? round2((p.cost / totalCost) * 100) : 0,
+    })).sort((a, b) => b.cost - a.cost);
+
+    // Format clients array
+    const clients = Array.from(clientsMap.values()).map((c) => ({
+      ...c,
+      stt_minutes: round2(c.stt_minutes),
+      cost: round2(c.cost),
+      tokens_percentage: totalTokens > 0 ? round2((c.total_tokens / totalTokens) * 100) : 0,
+      cost_percentage: totalCost > 0 ? round2((c.cost / totalCost) * 100) : 0,
+    })).sort((a, b) => b.cost - a.cost);
+
+    // Format timeline array sorted by date
+    const timeline = Array.from(timelineMap.values())
+      .map((t) => ({ ...t, cost: round2(t.cost) }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    // Also get active AI models from database to offer in filters
+    const registeredModels = await AIModel.find({ status: 'active' }).select('name display_name provider model_id').lean();
+    const filterOptionsModels = Array.from(
+      new Set([
+        ...registeredModels.map((m) => m.model_id),
+        ...Array.from(discoveredModels)
+      ])
+    ).filter(Boolean);
+
+    res.json({
+      success: true,
+      from,
+      to,
+      filter: {
+        user_id: req.query.user_id || 'all',
+        model: selectedModel || 'all',
+        available_models: filterOptionsModels,
+      },
+      summary: {
+        total_cost: round2(totalCost),
+        cost_breakdown: {
+          llm: round2(costLlm),
+          stt: round2(costStt),
+          tts: round2(costTts),
+        },
+        total_tokens: totalTokens,
+        input_tokens: totalInputTokens,
+        output_tokens: totalOutputTokens,
+        total_calls: totalAiCalls,
+        total_audio_minutes: round2(totalSttSeconds / 60),
+        total_tts_chars: totalTtsChars,
+        top_model: models[0]?.model_id || 'N/A',
+        top_provider: providers[0]?.provider || 'N/A',
+        avg_tokens_per_call: totalAiCalls > 0 ? Math.round(totalTokens / totalAiCalls) : 0,
+        avg_cost_per_call: totalAiCalls > 0 ? round2(totalCost / totalAiCalls) : 0,
+      },
+      models,
+      providers,
+      timeline,
+      clients,
+      recent_calls: recentCalls,
+    });
+  } catch (error) {
+    console.error('AI insights error:', error);
+    res.status(500).json({ success: false, message: 'Failed to build AI insights report' });
+  }
+};
+

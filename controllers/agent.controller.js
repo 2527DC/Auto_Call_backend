@@ -45,7 +45,13 @@ exports.getAgents = async (req, res) => {
       const totalDuration = calls.reduce((sum, c) => sum + (c.duration || 0), 0);
       const avgDuration = totalCalls > 0 ? Math.round(totalDuration / totalCalls) : 0;
 
-      const totalCredits = calls.reduce((sum, c) => sum + (c.credits_used || 0), 0);
+      const totalCredits = calls.reduce((sum, c) => {
+        if (typeof c.credits_used === 'number' && c.credits_used > 0) return sum + c.credits_used;
+        if (c.status === 'completed' && (c.duration || 0) > 0) {
+          return sum + Math.max(1, Math.ceil(c.duration / 60));
+        }
+        return sum;
+      }, 0);
 
       let calls_trend = [];
       if (totalCalls === 0) {

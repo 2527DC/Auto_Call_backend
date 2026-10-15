@@ -10,11 +10,17 @@ const storage = new AsyncLocalStorage();
 const newUsage = () => ({
   telephony_provider: null,
   stt_provider: null,
+  stt_model: null,
   stt_seconds: 0,
   tts_provider: null,
+  tts_model: null,
+  tts_voice: null,
   tts_characters: 0,
+  llm_provider: null,
+  llm_model: null,
   llm_input_tokens: 0,
   llm_output_tokens: 0,
+  cost_estimate: 0,
 });
 
 const runWithUsage = (usage, fn) => storage.run(usage, fn);

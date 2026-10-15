@@ -59,13 +59,28 @@ class CreditService {
     }
 
     if (user.roleId && (user.roleId.name === 'super_admin' || user.roleId.name === 'admin')) {
+      const balance = (user.total_credits || 0) - (user.used_credits || 0);
+      try {
+        await CreditUsage.create({
+          user_id: userId,
+          transaction_type: transactionType,
+          credits: -credits,
+          balance_after: balance,
+          description: `${description || ''} [Admin Test]`.trim(),
+          reference_id: referenceId,
+          reference_type: referenceType
+        });
+      } catch (logErr) {
+        console.error('[CreditService] Admin test credit log failed:', logErr.message);
+      }
+
       return {
         total_credits: user.total_credits || 0,
         used_credits: user.used_credits || 0,
-        available_credits: (user.total_credits || 0) - (user.used_credits || 0),
-        credits_deducted: 0,
+        available_credits: balance,
+        credits_deducted: credits,
         top_up_credits_used: 0,
-        regular_credits_used: 0,
+        regular_credits_used: credits,
         remaining_top_up_credits: user.top_up_credits || 0,
         is_admin: true
       };

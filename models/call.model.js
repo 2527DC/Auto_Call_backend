@@ -198,15 +198,21 @@ const CallSchema = new Schema(
       type: Boolean,
       default: false
     },
-    // What the call used from paid providers, for the cost and profit report.
+    // What the call used from paid providers, for the cost, token, and AI analytics report.
     usage: {
       telephony_provider: { type: String, default: null },
       stt_provider: { type: String, default: null },
+      stt_model: { type: String, default: null },
       stt_seconds: { type: Number, default: 0 },
       tts_provider: { type: String, default: null },
+      tts_model: { type: String, default: null },
+      tts_voice: { type: String, default: null },
       tts_characters: { type: Number, default: 0 },
+      llm_provider: { type: String, default: null },
+      llm_model: { type: String, default: null },
       llm_input_tokens: { type: Number, default: 0 },
-      llm_output_tokens: { type: Number, default: 0 }
+      llm_output_tokens: { type: Number, default: 0 },
+      cost_estimate: { type: Number, default: 0 }
     },
     post_call_handled: {
       type: Boolean,

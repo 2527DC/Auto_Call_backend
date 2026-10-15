@@ -16,11 +16,10 @@ exports.getAllVoices = async (req, res) => {
   try {
     const filter = req.query.scope === 'all' && isAdmin(req.user) ? {} : { status: 'active' };
     const voices = await Voice.find(filter).sort({ name: 1 });
-    const baseUrl = `${req.protocol}://${req.get('host')}`;
     const formattedVoices = voices.map(voice => {
       const v = voice.toObject ? voice.toObject() : { ...voice };
-      if (!v.preview_url || v.preview_url.startsWith('/api/') || v.provider === 'sarvam_ai') {
-        v.preview_url = `${baseUrl}/api/voices/${v.voice_id}/preview`;
+      if (!v.preview_url || v.preview_url.startsWith('/api/') || v.preview_url.includes('127.0.0.1') || v.preview_url.includes('localhost') || v.provider === 'sarvam_ai') {
+        v.preview_url = `/api/voices/${v.voice_id}/preview`;
       }
       return v;
     });

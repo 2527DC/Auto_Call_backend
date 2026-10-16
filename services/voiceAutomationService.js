@@ -107,12 +107,23 @@ const FILLER_WORD = /^(h?m+|mhm+|hm+|uh+|um+|huh|aha|ok+|okay|achh?a|accha|ह�
 // interested, is busy, or asks not to be called. The reply that says goodbye
 // ends with END_CALL_MARK, and the call ends once it has been said.
 const END_CALL_MARK = '[END_CALL]';
-const CALL_HANDLING_RULES = `CALL HANDLING:
-- If the caller says they are not interested, ask once, politely, whether another time would suit them better. If they still say no, thank them and say goodbye.
-- If the caller is busy or asks to be called later, ask what time suits them, repeat the time back, thank them and say goodbye.
-- If the caller asks not to be called again, or it is a wrong number, apologise briefly and say goodbye.
-- If the caller asks to speak to a person, say someone from the team will call them back, then say goodbye.
-- Only when you are saying goodbye and the conversation is over, end your reply with ${END_CALL_MARK}.`;
+const CALL_HANDLING_RULES = `CONVERSATION FLOW & CALL TERMINATION RULES (CRITICAL):
+1. CONTINUOUS CONVERSATION (DO NOT HANG UP PREMATURELY):
+   - When answering a caller's inquiry or providing information, NEVER end the call. NEVER use ${END_CALL_MARK} while answering questions or while having a conversation.
+   - After answering the caller's question or giving product/service information, ALWAYS politely ask if they have any other questions or need further clarification:
+     * In Kannada (kn): "ನಿಮಗೆ ಬೇರೆ ಏನಾದರೂ ಮಾಹಿತಿ ಬೇಕಾಗಿದೆಯೇ?" or "ನಾನು ನಿಮಗೆ ಬೇರೆ ಏನಾದರೂ ಸಹಾಯ ಮಾಡಬೇಕೆ?"
+     * In Hindi (hi): "क्या आपको कोई अन्य जानकारी चाहिए?" or "क्या मैं आपकी किसी और चीज़ में सहायता कर सकता हूँ?"
+     * In English (en): "Do you have any other questions or is there anything else I can help you with?"
+2. WHEN TO END THE CALL:
+   - You MUST ONLY end the call when:
+     a) The caller explicitly says they have NO MORE questions or needs (e.g., "ಇಲ್ಲ, ಧನ್ಯವಾದಗಳು", "ಇಲ್ಲ ಸಾಕು", "ಬೇರೆ ಏನೂ ಇಲ್ಲ", "no", "that is all", "nothing else", "no more questions", "bye", "thank you that is enough").
+     b) Or the caller explicitly asks to end the call / says goodbye.
+   - Only at that point: warmly thank the caller, wish them a good day, say goodbye, and append ${END_CALL_MARK} at the very end of your final goodbye sentence.
+     * In Kannada (kn): "ಭಾರತ ಸೈಕಲ್ ಹಬ್‌ಗೆ ಕರೆ ಮಾಡಿದ್ದಕ್ಕೆ ಧನ್ಯವಾದಗಳು. ನಿಮ್ಮ ದಿನ ಶುಭವಾಗಿರಲಿ! ${END_CALL_MARK}"
+     * In Hindi (hi): "कॉल करने के लिए धन्यवाद। आपका दिन शुभ हो! ${END_CALL_MARK}"
+     * In English (en): "Thank you for calling. Have a great day! ${END_CALL_MARK}"
+3. CALL TRANSFERS / HUMAN ASSISTANCE:
+   - If the caller asks to speak to a real person, manager, executive, or human agent, let them know you are connecting them to the team right away.`;
 
 class VoiceAutomationService extends EventEmitter {
   constructor() {
@@ -162,6 +173,22 @@ class VoiceAutomationService extends EventEmitter {
         update: async (opts = {}) => {
           if (opts.status === 'completed') {
             await plivoClient.calls.hangup(callId);
+          } else if (opts.transferNumber || opts.twiml) {
+            let targetNumber = opts.transferNumber;
+            if (!targetNumber && opts.twiml) {
+              const match = opts.twiml.match(/<Dial[^>]*>(?:<Number>)?([^<]+)(?:<\/Number>)?<\/Dial>/i);
+              if (match) targetNumber = match[1].trim();
+            }
+            if (targetNumber) {
+              const stream = this.activeStreams.get(callId) || [...this.activeStreams.values()].find(s => s.callSid === callId);
+              const callerId = stream?.fromNumber || stream?.toNumber || '';
+              const transferUrl = `${process.env.APP_URL}/api/calls/plivo-transfer-xml?to=${encodeURIComponent(targetNumber)}${callerId ? `&from=${encodeURIComponent(callerId)}` : ''}`;
+              await plivoClient.calls.transfer(callId, {
+                alegUrl: transferUrl,
+                alegMethod: 'POST'
+              });
+              console.log(`[Plivo] Call ${callId} successfully transferred to ${targetNumber} via ${transferUrl}`);
+            }
           } else {
             console.warn(`[Plivo] Call update not supported for Plivo calls (${Object.keys(opts).join(', ')}); call ${callId} left unchanged.`);
           }
@@ -824,6 +851,7 @@ class VoiceAutomationService extends EventEmitter {
         try {
           const actionUrl = process.env.APP_URL ? `${process.env.APP_URL}/api/calls/transfer-status` : '';
           await client.calls(streamForMark.callSid).update({
+            transferNumber: streamForMark.pendingTransfer,
             twiml: `<Response><Dial action="${actionUrl}"${streamForMark.pendingTransferRecordAttribute || ''}>${streamForMark.pendingTransfer}</Dial></Response>`
           });
           streamForMark.pendingTransfer = null;
@@ -1377,19 +1405,22 @@ class VoiceAutomationService extends EventEmitter {
     const isHangup = hangupPattern.test(text);
 
     if (currentAgentForChecks) {
-      if (currentAgentForChecks.transfer_to_human?.enabled && currentAgentForChecks.transfer_to_human?.transfer_keywords?.length > 0) {
-        const transferKeywords = currentAgentForChecks.transfer_to_human.transfer_keywords.map(k => k.toLowerCase().trim());
-        const isTransfer = transferKeywords.some(k => text.toLowerCase().includes(k));
+      if (currentAgentForChecks.transfer_to_human?.enabled) {
+        const customKeywords = (currentAgentForChecks.transfer_to_human.transfer_keywords || []).map(k => k.toLowerCase().trim()).filter(Boolean);
+        const defaultKeywords = ['human', 'agent', 'person', 'executive', 'representative', 'manager', 'speak to', 'talk to', 'transfer', 'ಮಾನವ', 'ಏಜೆಂಟ್', 'ಮ್ಯಾನೇಜರ್', 'ಅಧಿಕಾರಿ', 'ಮಾತನಾಡಬೇಕು', 'ವರ್ಗಾವಣೆ', 'बात करनी', 'प्रतिनिधि'];
+        const allKeywords = [...new Set([...customKeywords, ...defaultKeywords])];
+        const isTransfer = allKeywords.some(k => text.toLowerCase().includes(k));
 
-        if (isTransfer && currentAgentForChecks.transfer_to_human?.member_id) {
-          console.log('Transfer to human triggered. Transferring call.');
-
+        let transferNumber = currentAgentForChecks.transfer_to_human.transfer_phone_number;
+        if (!transferNumber && currentAgentForChecks.transfer_to_human.member_id) {
           const member = await db.TeamMember.findById(currentAgentForChecks.transfer_to_human.member_id);
-          if (!member || !member.phone_number) {
-            console.error('Transfer failed: Invalid team member or no phone number found');
-            return;
+          if (member?.phone_number) {
+            transferNumber = member.phone_number;
           }
-          const transferNumber = member.phone_number;
+        }
+
+        if (isTransfer && transferNumber) {
+          console.log(`Transfer to human triggered. Transferring call to ${transferNumber}`);
 
           const client = await this.getCallControlClient(stream.userId);
           if (client && stream.callSid) {
@@ -1397,18 +1428,27 @@ class VoiceAutomationService extends EventEmitter {
               const actionUrl = process.env.APP_URL ? `${process.env.APP_URL}/api/calls/transfer-status` : '';
               const recordAttribute = (currentAgentForChecks?.enable_call_recording || currentAgentForChecks?.enable_call_transcription) ? ' record="record-from-answer-dual"' : '';
               
+              const lang = String(currentAgentForChecks.language || 'en').toLowerCase().trim();
+              let transferHoldMsg = "Please hold while I transfer you to a human agent.";
+              if (lang === 'kn') {
+                transferHoldMsg = "ದಯವಿಟ್ಟು ಲೈನ್‌ನಲ್ಲಿ ಇರಿ, ನಾನು ನಿಮ್ಮ ಕರೆಯನ್ನು ನಮ್ಮ ಅಧಿಕಾರಿಗೆ ವರ್ಗಾಯಿಸುತ್ತಿದ್ದೇನೆ.";
+              } else if (lang === 'hi') {
+                transferHoldMsg = "कृपया लाइन पर बने रहें, मैं आपकी कॉल हमारे प्रतिनिधि को ट्रांसफर कर रहा हूँ।";
+              }
+
               if (earlyUserSettings?.elevenlabs_api_key) {
-                await this.speak(ws, streamSid, "Please hold while I transfer you to a human agent.", currentAgentForChecks.voice_id || null, earlyUserSettings.elevenlabs_api_key);
+                await this.speak(ws, streamSid, transferHoldMsg, currentAgentForChecks.voice_id || null, earlyUserSettings.elevenlabs_api_key);
                 stream.pendingTransfer = transferNumber;
                 stream.pendingTransferRecordAttribute = recordAttribute;
               } else {
                 const transferTwiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say voice="Polly.Joanna">Please hold while I transfer you to a human agent.</Say>
+    <Say voice="Polly.Joanna">${transferHoldMsg}</Say>
     <Dial action="${actionUrl}"${recordAttribute}>${transferNumber}</Dial>
 </Response>`;
 
                 await client.calls(stream.callSid).update({
+                  transferNumber: transferNumber,
                   twiml: transferTwiml
                 });
               }
@@ -1695,8 +1735,13 @@ class VoiceAutomationService extends EventEmitter {
             if (turnAbort.signal.aborted || stream.ending) return;
             let cleanSentence = (sentence || '').replace(/^\s*(assistant|agent|ai)\s*(\([^)]*\))?\s*:\s*/i, '').trim();
             if (cleanSentence.includes(END_CALL_MARK)) {
-              endsCall = true;
               cleanSentence = cleanSentence.split(END_CALL_MARK).join(' ').replace(/\s+/g, ' ').trim();
+              const isQuestion = cleanSentence.includes('?') || /(ಬೇಕಾಗಿದೆಯೇ|ಮಾಡಬೇಕೆ|ತಿಳಿಸಬೇಕೆ|ಹೇಳಬೇಕೆ|ಹೇಗೆ ಸಹಾಯ|ಯಾವ ಮಾದರಿಯ|ಯಾವ ಬ್ರಾಂಡ್|need help|any other|anything else|or else)/i.test(cleanSentence);
+              if (!isQuestion) {
+                endsCall = true;
+              } else {
+                console.log(`[Voice] Ignored accidental ${END_CALL_MARK} on query sentence: "${cleanSentence}"`);
+              }
             }
             if (!cleanSentence) return;
 
@@ -1753,8 +1798,13 @@ class VoiceAutomationService extends EventEmitter {
           if (!firstSentenceDispatched && rawResponse && rawResponse.trim() && !turnAbort.signal.aborted) {
             let labelled = rawResponse.replace(/^\s*(assistant|agent|ai)\s*(\([^)]*\))?\s*:\s*/i, '');
             if (labelled.includes(END_CALL_MARK)) {
-              endsCall = true;
               labelled = labelled.split(END_CALL_MARK).join(' ').replace(/\s+/g, ' ').trim();
+              const isQuestion = labelled.includes('?') || /(ಬೇಕಾಗಿದೆಯೇ|ಮಾಡಬೇಕೆ|ತಿಳಿಸಬೇಕೆ|ಹೇಳಬೇಕೆ|ಹೇಗೆ ಸಹಾಯ|ಯಾವ ಮಾದರಿಯ|ಯಾವ ಬ್ರಾಂಡ್|need help|any other|anything else|or else)/i.test(labelled);
+              if (!isQuestion) {
+                endsCall = true;
+              } else {
+                console.log(`[Voice] Ignored accidental ${END_CALL_MARK} on query fallback: "${labelled}"`);
+              }
             }
             const nextResponse = labelled.trim();
             if (nextResponse) {

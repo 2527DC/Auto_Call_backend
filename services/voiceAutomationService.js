@@ -269,14 +269,31 @@ class VoiceAutomationService extends EventEmitter {
   // answeredAt: when the call's audio stream started, i.e. when it was picked
   // up. The call log's started_at is set when the call is placed, so billing
   // from it would charge for the ringing.
-  async handleStreamCallCompletion(callSid, userId, answeredAt = null) {
+  // answeredAt: when the call's audio stream started, i.e. when it was picked
+  // up. The call log's started_at is set when the call is placed, so billing
+  // from it would charge for the ringing.
+  async handleStreamCallCompletion(streamOrSid, userId, answeredAt = null) {
     try {
-      if (!callSid) return;
-      const call = await Call.findOne({ twilio_call_sid: callSid });
+      if (!streamOrSid) return;
+      const isObj = typeof streamOrSid === 'object';
+      const callSid = isObj ? streamOrSid.callSid : streamOrSid;
+      const callLogId = isObj ? streamOrSid.callLogId : null;
+      const requestUuid = isObj ? streamOrSid.requestUuid : null;
+
+      const query = {
+        $or: [
+          ...(callLogId ? [{ _id: callLogId }] : []),
+          ...(callSid ? [{ twilio_call_sid: callSid }] : []),
+          ...(requestUuid ? [{ twilio_call_sid: requestUuid }] : [])
+        ]
+      };
+      if (!query.$or.length) return;
+
+      const call = await Call.findOne(query);
       if (!call) return;
 
       const finalStatuses = ['completed', 'failed', 'busy', 'no-answer', 'canceled', 'declined', 'missed'];
-      if (finalStatuses.includes(call.status)) return;
+      const alreadyEnded = finalStatuses.includes(call.status);
 
       const now = new Date();
       call.status = 'completed';
@@ -288,38 +305,53 @@ class VoiceAutomationService extends EventEmitter {
         call.started_at = now;
         call.duration = 1;
       }
+      if (isObj && streamOrSid.usage) {
+        call.usage = streamOrSid.usage;
+      }
       await call.save();
-      console.log(`[Stream Closed] Call ${callSid} status updated to completed. Duration: ${call.duration}s`);
+      console.log(`[Stream Closed] Call ${call.twilio_call_sid || call._id} status updated to completed. Duration: ${call.duration}s`);
+
+      // Trigger post-call outcome analysis
+      outcomeService.request(call._id).catch(err => console.error('[Outcome] Trigger error on stream completion:', err.message));
 
       // Realtime notification to frontend
-      if (userId && this.io) {
-        this.io.emit(`call-status-update-${userId}`, {
+      const effectiveUserId = userId || call.user_id;
+      if (this.io) {
+        const statusPayload = {
           callSid: call.twilio_call_sid,
-          status: 'completed'
-        });
-      }
-
-      // Process credit deduction
-      try {
-        const creditResult = await creditService.processCallCreditDeduction(
-          call.user_id,
-          call._id,
-          call.duration || 0
-        );
-        if (creditResult && creditResult.credits_deducted !== undefined) {
-          call.credits_used = creditResult.credits_deducted;
-          await call.save();
+          callId: String(call._id),
+          status: 'completed',
+          duration: call.duration
+        };
+        if (effectiveUserId) {
+          this.io.emit(`call-status-update-${effectiveUserId}`, statusPayload);
         }
-      } catch (cErr) {
-        console.error('[Stream Closed] Credit deduction error:', cErr.message);
+        this.io.emit('call-status-update', statusPayload);
       }
 
-      // Webhook event
-      try {
-        const webhookDispatcher = require('./webhookDispatcher');
-        webhookDispatcher.dispatchEvent(call.user_id, call.direction === 'inbound' ? 'Inbound Call Finished' : 'Call Finished', call);
-      } catch (wErr) {
-        console.error('[Stream Closed] Webhook error:', wErr.message);
+      // Process credit deduction if not already finalized
+      if (!alreadyEnded) {
+        try {
+          const creditResult = await creditService.processCallCreditDeduction(
+            call.user_id,
+            call._id,
+            call.duration || 0
+          );
+          if (creditResult && creditResult.credits_deducted !== undefined) {
+            call.credits_used = creditResult.credits_deducted;
+            await call.save();
+          }
+        } catch (cErr) {
+          console.error('[Stream Closed] Credit deduction error:', cErr.message);
+        }
+
+        // Webhook event
+        try {
+          const webhookDispatcher = require('./webhookDispatcher');
+          webhookDispatcher.dispatchEvent(call.user_id, call.direction === 'inbound' ? 'Inbound Call Finished' : 'Call Finished', call);
+        } catch (wErr) {
+          console.error('[Stream Closed] Webhook error:', wErr.message);
+        }
       }
     } catch (err) {
       console.error('[Stream Closed] Error completing call on stream close:', err.message);
@@ -332,15 +364,26 @@ class VoiceAutomationService extends EventEmitter {
     clearInterval(closingStream.idleTimer);
     clearTimeout(closingStream.maxDurationTimer);
     this.finishHello(closingStream, 'ended');
-    if (closingStream.callSid) {
+    if (closingStream.callSid || closingStream.callLogId || closingStream.requestUuid) {
       // The agent ended it (goodbye, silence, time limit), else the caller hung up.
       const ended = { end_reason: closingStream.endReason || 'caller_hung_up' };
       if (closingStream.usage) ended.usage = closingStream.usage;
-      Call.updateOne({ twilio_call_sid: closingStream.callSid }, { $set: ended })
+
+      const query = {
+        $or: [
+          ...(closingStream.callLogId ? [{ _id: closingStream.callLogId }] : []),
+          ...(closingStream.callSid ? [{ twilio_call_sid: closingStream.callSid }] : []),
+          ...(closingStream.requestUuid ? [{ twilio_call_sid: closingStream.requestUuid }] : [])
+        ]
+      };
+
+      Call.updateOne(query, { $set: ended })
+        .then(res => console.log(`[Usage] Saved call usage (matched ${res.matchedCount}):`, closingStream.usage))
         .catch((e) => console.error('[Usage] Could not save call usage:', e.message));
-      this.handleStreamCallCompletion(closingStream.callSid, closingStream.userId, closingStream.callStartTime);
-      this.handlePostCallIntegrations(closingStream.callSid, closingStream.userId);
-      this.plivoCallIds.delete(closingStream.callSid);
+
+      this.handleStreamCallCompletion(closingStream, closingStream.userId, closingStream.callStartTime);
+      this.handlePostCallIntegrations(closingStream.callSid || closingStream.requestUuid, closingStream.userId);
+      if (closingStream.callSid) this.plivoCallIds.delete(closingStream.callSid);
     }
     this.activeStreams.delete(streamSid);
     console.log(`Stream stopped: ${streamSid}`);
@@ -971,14 +1014,16 @@ class VoiceAutomationService extends EventEmitter {
             // Plivo's extraHeaders may arrive in the start event or on the WebSocket handshake.
             customData = {
               ...this.parsePlivoExtraHeaders(req?.headers?.['x-ph-extraheaders'] || req?.headers?.['extraheaders']),
-              ...Object.fromEntries(['agentid', 'userid', 'flowid', 'direction']
+              ...Object.fromEntries(['agentid', 'userid', 'flowid', 'direction', 'requestuuid', 'calluuid']
                 .filter(key => req?.headers?.[`x-ph-${key}`] || req?.headers?.[key])
-                .map(key => [{ agentid: 'agentId', userid: 'userId', flowid: 'flowId', direction: 'direction' }[key], req.headers[`x-ph-${key}`] || req.headers[key]])),
+                .map(key => [{ agentid: 'agentId', userid: 'userId', flowid: 'flowId', direction: 'direction', requestuuid: 'requestUuid', calluuid: 'callUuid' }[key], req.headers[`x-ph-${key}`] || req.headers[key]])),
               ...this.parsePlivoExtraHeaders(msg.start.extraHeaders || msg.start.extra_headers || msg.extraHeaders)
             };
             // Last resort: plivo-inbound / plivo-xml saved the call with its agent and user.
-            if (!customData.agentId && !customData.flowId && callSid) {
-              const knownCall = await Call.findOne({ twilio_call_sid: callSid }).lean();
+            if (!customData.agentId && !customData.flowId && (callSid || customData.requestUuid || customData.callUuid)) {
+              const knownCall = await Call.findOne({
+                twilio_call_sid: { $in: [callSid, customData.requestUuid, customData.callUuid].filter(Boolean) }
+              }).lean();
               if (knownCall) {
                 customData.agentId = knownCall.agent_id?.toString();
                 customData.flowId = knownCall.flow_id?.toString();
@@ -995,6 +1040,8 @@ class VoiceAutomationService extends EventEmitter {
             usage,
             provider: isPlivo ? 'plivo' : 'twilio',
             callSid,
+            requestUuid: customData.requestUuid || null,
+            callLogId: null,
             flowId,
             agentId,
             userId,
@@ -1020,9 +1067,12 @@ class VoiceAutomationService extends EventEmitter {
             const isValidId = (id) => id && db.mongoose.Types.ObjectId.isValid(id);
             const hasFlow = isValidId(flowId);
             const hasAgent = !hasFlow && isValidId(agentId);
+            const callLookup = {
+              twilio_call_sid: { $in: [callSid, customData.requestUuid, customData.callUuid].filter(Boolean) }
+            };
             // Independent lookups run together; each Atlas round trip adds to the silence before the greeting.
             const [callLog, userSettings, flow, flowAgent, directAgent] = await Promise.all([
-              Call.findOne({ twilio_call_sid: callSid }),
+              Call.findOne(callLookup),
               isValidId(userId) ? UserSettings.findOne({ user: userId }).populate('ai_model') : null,
               hasFlow ? Flow.findById(flowId) : null,
               hasFlow ? Agent.findOne({ flow_id: flowId }).populate('llm_model', 'model_id provider name').populate('knowledge_base') : null,
@@ -1030,6 +1080,12 @@ class VoiceAutomationService extends EventEmitter {
             ]);
             const startStream = this.activeStreams.get(streamSid);
             if (startStream) {
+              if (callLog && callSid && callLog.twilio_call_sid !== callSid) {
+                callLog.twilio_call_sid = callSid;
+                await callLog.save().catch(e => console.error('[Stream] Could not update callSid:', e.message));
+              }
+              startStream.requestUuid = customData.requestUuid;
+              startStream.callLogId = callLog?._id;
               const activeAgent = hasFlow ? flowAgent : directAgent;
               startStream.agent = activeAgent;
               startStream.userSettings = userSettings;

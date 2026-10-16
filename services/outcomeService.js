@@ -342,6 +342,25 @@ class OutcomeService {
     // (toObject() drops _id in this app, see models/index.js)
     const saved = { ...call.toObject(), _id: call._id, outcome, contact_id: contact?._id || call.contact_id };
 
+    try {
+      const { getIo, emitToAccount } = require('../utils/realtime');
+      const io = getIo();
+      if (io) {
+        const payload = {
+          callId: String(call._id),
+          callSid: call.twilio_call_sid,
+          outcome: outcome
+        };
+        if (call.user_id) {
+          emitToAccount(call.user_id, 'call-status-update', payload);
+          io.emit(`call-status-update-${call.user_id}`, payload);
+        }
+        io.emit('call-status-update', payload);
+      }
+    } catch (e) {
+      console.error('[Outcome] Realtime emit error:', e.message);
+    }
+
     const change = contact ? await this.applyToContact(contact._id, saved, def, outcome.details, settings, { source: decided.source }) : null;
     await this.charge(saved, decided).catch(err => console.error('[Outcome] Charge failed:', err.message));
     this.afterOutcome(saved, def, settings, contact, change);

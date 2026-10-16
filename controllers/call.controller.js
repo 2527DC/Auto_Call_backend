@@ -95,9 +95,9 @@ exports.generateTwiML = async (req, res) => {
 
 // Plivo's <Stream> takes the WebSocket URL as its text and passes context as
 // "key=value;key=value" extraHeaders (it has no Twilio-style <Parameter> children).
-const buildPlivoStreamXml = ({ flowId, agentId, userId, direction = null, record = false }) => {
+const buildPlivoStreamXml = ({ flowId, agentId, userId, direction = null, record = false, requestUuid = null, callUuid = null }) => {
   const appUrl = process.env.APP_URL.replace('http', 'ws');
-  const headers = Object.entries({ flowId, agentId, userId, direction })
+  const headers = Object.entries({ flowId, agentId, userId, direction, requestUuid, callUuid })
     .filter(([, value]) => value && value !== 'undefined' && value !== 'null')
     .map(([key, value]) => `${key}=${value}`)
     .join(';');
@@ -116,6 +116,16 @@ const buildPlivoStreamXml = ({ flowId, agentId, userId, direction = null, record
 
 exports.generatePlivoXML = async (req, res) => {
   const { flowId, userId, agentId, dir, rec } = req.query;
+  const payload = { ...req.query, ...req.body };
+  const callUuid = payload.CallUUID || payload.call_uuid;
+  const requestUuid = payload.RequestUUID || payload.request_uuid;
+
+  if (requestUuid && callUuid) {
+    await Call.updateOne(
+      { twilio_call_sid: requestUuid },
+      { $set: { twilio_call_sid: callUuid, started_at: new Date(), status: 'in-progress' } }
+    ).catch(err => console.error('[Plivo XML] Failed to map CallUUID:', err.message));
+  }
 
   // Calls placed by Voxeno carry the recording choice in the URL, so the answer
   // needs no database round trip; older URLs still look it up.
@@ -126,7 +136,15 @@ exports.generatePlivoXML = async (req, res) => {
   }
 
   res.type('text/xml');
-  res.send(buildPlivoStreamXml({ flowId, agentId, userId, record, direction: dir === 'out' ? 'outbound' : null }));
+  res.send(buildPlivoStreamXml({
+    flowId,
+    agentId,
+    userId,
+    record,
+    direction: dir === 'out' ? 'outbound' : null,
+    requestUuid,
+    callUuid
+  }));
 };
 
 exports.handleStatusCallback = async (req, res) => {
@@ -222,14 +240,22 @@ exports.handleStatusCallback = async (req, res) => {
 };
 
 exports.handlePlivoStatusCallback = async (req, res) => {
-  const { CallUUID, RequestUUID, CallStatus, Duration, RecordUrl, Event, HangupCause } = req.body;
+  const payload = { ...req.query, ...req.body };
+  const CallUUID = payload.CallUUID || payload.call_uuid;
+  const RequestUUID = payload.RequestUUID || payload.request_uuid;
+  const CallStatus = payload.CallStatus || payload.call_status || payload.status;
+  const rawDuration = payload.Duration || payload.duration || payload.CallDuration || payload.call_duration || payload.TotalCallDuration || payload.total_call_duration || payload.BillDuration || payload.bill_duration;
+  const RecordUrl = payload.RecordUrl || payload.record_url || payload.RecordingUrl || payload.recording_url;
+  const Event = payload.Event || payload.event;
+  const HangupCause = payload.HangupCause || payload.hangup_cause;
+
   try {
     let mappedCallStatus = CallStatus;
     if (CallStatus === 'busy') mappedCallStatus = 'declined';
     if (CallStatus === 'no-answer') mappedCallStatus = 'missed';
 
     // Handle Plivo Hangup event or cause if CallStatus is in-progress or missing
-    if (Event === 'Hangup' || HangupCause) {
+    if (Event?.toLowerCase() === 'hangup' || HangupCause) {
       if (!mappedCallStatus || mappedCallStatus === 'in-progress') {
         if (HangupCause === 'USER_BUSY' || HangupCause === 'REJECTED') {
           mappedCallStatus = 'declined';
@@ -241,19 +267,40 @@ exports.handlePlivoStatusCallback = async (req, res) => {
       }
     }
 
-    const isEnded = ['completed', 'failed', 'busy', 'no-answer', 'canceled', 'declined', 'missed'].includes(mappedCallStatus) || ['completed', 'failed', 'busy', 'no-answer', 'canceled', 'declined', 'missed'].includes(CallStatus);
+    const isEnded = ['completed', 'failed', 'busy', 'no-answer', 'canceled', 'declined', 'missed'].includes(mappedCallStatus) ||
+      ['completed', 'failed', 'busy', 'no-answer', 'canceled', 'declined', 'missed'].includes(CallStatus) ||
+      Event?.toLowerCase() === 'hangup' ||
+      Boolean(HangupCause);
 
     const updateData = {};
     if (mappedCallStatus) updateData.status = mappedCallStatus;
-    if (Duration) updateData.duration = Number(Duration);
-    if (isEnded) updateData.ended_at = new Date();
+    if (rawDuration !== undefined && rawDuration !== null && rawDuration !== '') {
+      updateData.duration = Number(rawDuration);
+    }
+    if (isEnded) {
+      updateData.ended_at = new Date();
+      if (!updateData.status || updateData.status === 'in-progress') {
+        updateData.status = 'completed';
+      }
+    }
     if (RecordUrl) updateData.recording_url = RecordUrl;
 
     let skipStatusEvents = false;
     // Plivo's recording callback arrives after hangup still reporting
     // CallStatus=in-progress; never move a finished call back to a live status.
+    const query = {
+      $or: [
+        ...(CallUUID ? [{ twilio_call_sid: CallUUID }] : []),
+        ...(RequestUUID ? [{ twilio_call_sid: RequestUUID }] : [])
+      ]
+    };
+
+    if (query.$or.length === 0) {
+      return res.sendStatus(200);
+    }
+
     if (updateData.status && !isEnded) {
-      const existing = await Call.findOne({ twilio_call_sid: { $in: [CallUUID, RequestUUID] } }).select('status').lean();
+      const existing = await Call.findOne(query).select('status').lean();
       const finalStatuses = ['completed', 'failed', 'busy', 'no-answer', 'canceled', 'declined', 'missed'];
       if (existing && finalStatuses.includes(existing.status)) {
         delete updateData.status;
@@ -262,7 +309,7 @@ exports.handlePlivoStatusCallback = async (req, res) => {
     }
 
     let call = await Call.findOneAndUpdate(
-      { twilio_call_sid: { $in: [CallUUID, RequestUUID] } },
+      query,
       updateData,
       { new: true }
     );
@@ -272,15 +319,26 @@ exports.handlePlivoStatusCallback = async (req, res) => {
       await call.save();
     }
 
+    if (call && isEnded && (!call.duration || call.duration === 0) && call.started_at) {
+      const endTime = call.ended_at ? new Date(call.ended_at).getTime() : Date.now();
+      call.duration = Math.max(1, Math.round((endTime - new Date(call.started_at).getTime()) / 1000));
+      await call.save();
+    }
+
     if (call && call.user_id && req.app.get('io')) {
-      req.app.get('io').emit(`call-status-update-${call.user_id}`, {
+      const io = req.app.get('io');
+      const statusPayload = {
         callSid: call.twilio_call_sid || CallUUID || RequestUUID,
-        status: mappedCallStatus || call.status
-      });
+        callId: String(call._id),
+        status: call.status,
+        duration: call.duration
+      };
+      io.emit(`call-status-update-${call.user_id}`, statusPayload);
+      io.emit('call-status-update', statusPayload);
     }
 
     if (call && call.user_id && !skipStatusEvents) {
-      const effectiveStatus = mappedCallStatus || CallStatus;
+      const effectiveStatus = call.status || mappedCallStatus || CallStatus;
       if (effectiveStatus === 'completed') {
         webhookDispatcher.dispatchEvent(call.user_id, call.direction === 'inbound' ? 'Inbound Call Finished' : 'Call Finished', call);
       } else if (effectiveStatus === 'failed' || effectiveStatus === 'canceled') {
@@ -296,12 +354,7 @@ exports.handlePlivoStatusCallback = async (req, res) => {
       }
     }
 
-    if (call && isEnded && call.duration === 0 && call.started_at && call.ended_at) {
-      call.duration = Math.max(0, Math.round((call.ended_at.getTime() - call.started_at.getTime()) / 1000));
-      await call.save();
-    }
-
-    if (call && (CallStatus === 'completed' || mappedCallStatus === 'completed') && call.user_id) {
+    if (call && (CallStatus === 'completed' || mappedCallStatus === 'completed' || call.status === 'completed') && call.user_id) {
       try {
         const callDuration = call.duration || 0;
         const creditResult = await creditService.processCallCreditDeduction(
@@ -309,15 +362,19 @@ exports.handlePlivoStatusCallback = async (req, res) => {
           call._id,
           callDuration
         );
-        call.credits_used = creditResult.credits_deducted;
-        await call.save();
+        if (creditResult?.credits_deducted !== undefined) {
+          call.credits_used = creditResult.credits_deducted;
+          await call.save();
+        }
       } catch (creditError) {
         console.error('Credit deduction error:', creditError.message);
       }
     }
 
     // What happened on the call (no answer, busy... or the AI's reading of it).
-    if (call && isEnded) outcomeService.request(call._id).catch(() => {});
+    if (call && isEnded) {
+      outcomeService.request(call._id).catch((err) => console.error('[Outcome] Request error:', err.message));
+    }
 
     res.sendStatus(200);
   } catch (error) {

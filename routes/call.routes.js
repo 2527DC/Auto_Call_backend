@@ -12,9 +12,9 @@ router.post('/transfer-status', callController.handleTransferStatusCallback);
 router.post('/recording-callback', callController.handleRecordingCallback);
 router.post('/inbound', callController.handleInboundCall);
 
-router.post('/plivo-xml', callController.generatePlivoXML);
-router.post('/plivo-status', callController.handlePlivoStatusCallback);
-router.post('/plivo-inbound', callController.handlePlivoInboundCall);
+router.all('/plivo-xml', callController.generatePlivoXML);
+router.all('/plivo-status', callController.handlePlivoStatusCallback);
+router.all('/plivo-inbound', callController.handlePlivoInboundCall);
 router.all('/plivo-transfer-xml', callController.generatePlivoTransferXML);
 
 router.use(authenticate);

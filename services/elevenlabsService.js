@@ -526,8 +526,9 @@ class ElevenLabsService {
       console.log('ElevenLabs STT Response:', response.data.text);
       return response.data.text || '';
     } catch (error) {
-      console.error('ElevenLabs STT Error:', error.response?.data || error.message);
-      return '';
+      const errorMsg = error.response?.data ? JSON.stringify(error.response.data) : error.message;
+      console.error('ElevenLabs STT Error:', errorMsg);
+      throw new Error(`ElevenLabs STT Failed: ${errorMsg}`);
     }
   }
 

@@ -780,40 +780,88 @@ class VoiceAutomationService extends EventEmitter {
     return ttsCache.keyFor(provider, voiceId, text, variant);
   }
 
+  async resolveApiKey(provider, userSettings = null) {
+    let key = null;
+    if (provider === 'sarvam_ai') {
+      key = userSettings?.sarvam_ai_api_key || sarvamService.apiKey;
+      if (!key) {
+        const platformSetting = await Setting.findOne().select('sarvam_ai_api_key').lean().catch(() => null);
+        key = platformSetting?.sarvam_ai_api_key;
+      }
+      if (!key) {
+        const anyUser = await UserSettings.findOne({ sarvam_ai_api_key: { $ne: null } }).select('sarvam_ai_api_key').lean().catch(() => null);
+        key = anyUser?.sarvam_ai_api_key;
+      }
+    } else if (provider === 'deepgram') {
+      key = userSettings?.deepgram_api_key || deepgramService.apiKey;
+      if (!key) {
+        const platformSetting = await Setting.findOne().select('deepgram_api_key').lean().catch(() => null);
+        key = platformSetting?.deepgram_api_key;
+      }
+      if (!key) {
+        const anyUser = await UserSettings.findOne({ deepgram_api_key: { $ne: null } }).select('deepgram_api_key').lean().catch(() => null);
+        key = anyUser?.deepgram_api_key;
+      }
+    } else if (provider === 'elevenlabs') {
+      key = userSettings?.elevenlabs_api_key || elevenLabsService.apiKey;
+      if (!key) {
+        const platformSetting = await Setting.findOne().select('elevenlabs_api_key').lean().catch(() => null);
+        key = platformSetting?.elevenlabs_api_key;
+      }
+      if (!key) {
+        const anyUser = await UserSettings.findOne({ elevenlabs_api_key: { $ne: null } }).select('elevenlabs_api_key').lean().catch(() => null);
+        key = anyUser?.elevenlabs_api_key;
+      }
+    }
+    return key;
+  }
+
   // Phone audio (8 kHz mu-law, base64) for text, or null when the provider has
   // no API key. requestedProvider is the provider speak() was asked for; its
   // apiKey argument only belongs to that provider.
   async synthesize({ provider, voiceId, text, settings, apiKey, language = null, model = null, requestedProvider = 'elevenlabs', deepgramApiKey = null }) {
-    if (provider === 'deepgram') {
-      const dgApiKey = deepgramApiKey || settings?.deepgram_api_key || deepgramService.apiKey;
-      if (!dgApiKey) {
-        console.warn('[TTS] No Deepgram API key found. Falling back to Twilio <Say>.');
-        return null;
+    const isIndic = (language && /^(kn|hi|te|ta|mr|gu|bn|pa|ml|or)/i.test(language)) || /[\u0900-\u0D7F]/.test(text) || /[\u0C80-\u0CFF]/.test(text);
+
+    // Primary provider first, followed by best fallbacks
+    const fallbackList = [
+      provider,
+      ...(isIndic ? ['sarvam_ai', 'deepgram', 'elevenlabs'] : ['elevenlabs', 'deepgram', 'sarvam_ai'])
+    ];
+    const providersToTry = [...new Set(fallbackList.filter(Boolean))];
+
+    for (const prov of providersToTry) {
+      try {
+        if (prov === 'deepgram') {
+          const dgApiKey = deepgramApiKey || (prov === provider ? apiKey : null) || await this.resolveApiKey('deepgram', settings);
+          if (!dgApiKey) continue;
+          const dgVoice = (prov === provider && voiceId && voiceId.startsWith('aura-')) ? voiceId : 'aura-asteria-en';
+          const mulawBuffer = await deepgramService.generateSpeech(text, dgVoice, {}, dgApiKey, 8000, 'mulaw');
+          return mulawBuffer.toString('base64');
+        }
+
+        if (prov === 'sarvam_ai') {
+          const sarvamApiKey = settings?.sarvam_ai_api_key || await this.resolveApiKey('sarvam_ai', settings);
+          if (!sarvamApiKey) continue;
+          const sarvamVoice = (prov === provider && voiceId && !voiceId.includes('-') && voiceId.length < 20) ? voiceId : 'shubh';
+          const targetLang = (language && /^(kn|hi|te|ta|mr|gu|bn|pa|ml|or)/i.test(language)) ? `${language.toLowerCase()}-IN` : (text.match(/[\u0C80-\u0CFF]/) ? 'kn-IN' : (text.match(/[\u0900-\u0D7F]/) ? 'hi-IN' : 'en-IN'));
+          const pcmBuffer = await sarvamService.generateSpeech(text, sarvamVoice, { target_language_code: targetLang }, sarvamApiKey, 8000);
+          return this.encodePcmToUlaw(pcmBuffer, pcmBuffer.sampleRate || 8000).toString('base64');
+        }
+
+        if (prov === 'elevenlabs') {
+          const elApiKey = (prov === requestedProvider ? apiKey : null) || (prov === provider ? apiKey : null) || settings?.elevenlabs_api_key || await this.resolveApiKey('elevenlabs', settings);
+          if (!elApiKey) continue;
+          const elVoice = (prov === provider && voiceId) ? voiceId : 'JBFqnCBsd6RMkjVDRZzb';
+          const pcmBuffer = await elevenLabsService.generateSpeech(text, elVoice, { language, model }, elApiKey);
+          return this.encodePcmToUlaw(pcmBuffer, 16000).toString('base64');
+        }
+      } catch (err) {
+        console.warn(`[TTS ${prov}] Failed: ${err.message}. Attempting next available provider...`);
       }
-      const mulawBuffer = await deepgramService.generateSpeech(text, voiceId || 'aura-asteria-en', {}, dgApiKey, 8000, 'mulaw');
-      return mulawBuffer.toString('base64');
     }
 
-    if (provider === 'sarvam_ai') {
-      let sarvamApiKey = settings?.sarvam_ai_api_key || sarvamService.apiKey;
-      if (!sarvamApiKey && apiKey && !apiKey.startsWith('sk_75') && !apiKey.startsWith('sk_f1')) {
-        sarvamApiKey = apiKey;
-      }
-      if (!sarvamApiKey) {
-        console.warn('[TTS] No Sarvam AI API key found. Falling back to Twilio <Say>.');
-        return null;
-      }
-      const pcmBuffer = await sarvamService.generateSpeech(text, voiceId || 'shubh', {}, sarvamApiKey, 8000);
-      return this.encodePcmToUlaw(pcmBuffer, pcmBuffer.sampleRate || 8000).toString('base64');
-    }
-
-    const elApiKey = (provider === requestedProvider ? apiKey : null) || settings?.elevenlabs_api_key || elevenLabsService.apiKey;
-    if (!elApiKey) {
-      console.warn('[TTS] No ElevenLabs API key found. Falling back to Twilio <Say>.');
-      return null;
-    }
-    const pcmBuffer = await elevenLabsService.generateSpeech(text, voiceId || 'JBFqnCBsd6RMkjVDRZzb', { language, model }, elApiKey);
-    return this.encodePcmToUlaw(pcmBuffer, 16000).toString('base64');
+    console.warn('[TTS] All providers failed or unconfigured.');
+    return null;
   }
 
   // Makes audio ahead of time and keeps it (memory + disk); does nothing if it
@@ -832,8 +880,7 @@ class VoiceAutomationService extends EventEmitter {
         text,
         settings,
         language,
-        model,
-        apiKey: settings?.elevenlabs_api_key
+        model
       });
       if (audio) ttsCache.set(key, audio, { persist: true });
     })().finally(() => this.warming.delete(key));
@@ -1944,46 +1991,48 @@ class VoiceAutomationService extends EventEmitter {
         }
       }
 
-      const provider = agent?.voice_provider || (agent?.telephony_provider?.startsWith('deepgram') ? 'deepgram' : (agent?.telephony_provider?.startsWith('sarvam_ai') ? 'sarvam_ai' : 'elevenlabs'));
-      recordUsage({ stt_provider: provider, stt_seconds: buffer.length / 8000 });
-
+      const primaryProvider = agent?.voice_provider || (agent?.telephony_provider?.startsWith('deepgram') ? 'deepgram' : (agent?.telephony_provider?.startsWith('sarvam_ai') ? 'sarvam_ai' : 'elevenlabs'));
       const noiseTokens = ['[background noise]', '[pause]', '[laughs]', '[clicking]', '[phone ringing]', '[phone beeping]', '[outro jingle]', '[silence]', '[phone hangs up]', '[phone hanging up]', '[phone clicks]'];
 
-      if (provider === 'deepgram') {
-        const apiKey = userSettings?.deepgram_api_key;
-        const wavBuffer = this.createUlawWav(buffer);
-        deepgramService.saveAudio(wavBuffer, `inbound_${Date.now()}.wav`).catch(() => {});
-        const text = await deepgramService.transcribeAudio(wavBuffer, apiKey);
-        const cleanedText = text ? text.trim() : '';
-        if (!cleanedText || noiseTokens.some(token => cleanedText.toLowerCase().includes(token))) {
-          console.log(`Ignoring noise/silence token: ${cleanedText}`);
-          return null;
+      // Primary provider tried first, followed by available fallbacks (deepgram is fastest and most reliable for telephony)
+      const fallbackList = [primaryProvider, 'deepgram', 'sarvam_ai', 'elevenlabs'];
+      const providersToTry = [...new Set(fallbackList.filter(Boolean))];
+
+      const wavBuffer = this.createUlawWav(buffer);
+      const languageCode = agent?.language ? String(agent.language).split(/[-_]/)[0].toLowerCase() : null;
+
+      for (const prov of providersToTry) {
+        const apiKey = await this.resolveApiKey(prov, userSettings);
+        if (!apiKey) continue;
+
+        try {
+          let text = null;
+          if (prov === 'deepgram') {
+            deepgramService.saveAudio(wavBuffer, `inbound_${Date.now()}.wav`).catch(() => {});
+            text = await deepgramService.transcribeAudio(wavBuffer, apiKey);
+          } else if (prov === 'sarvam_ai') {
+            sarvamService.saveAudio(wavBuffer, `inbound_${Date.now()}.wav`).catch(() => {});
+            text = await sarvamService.transcribeAudio(wavBuffer, apiKey);
+          } else if (prov === 'elevenlabs') {
+            elevenLabsService.saveAudio(wavBuffer, `inbound_${Date.now()}.mp3`).catch(() => {});
+            text = await elevenLabsService.transcribeAudio(wavBuffer, apiKey, languageCode);
+          }
+
+          if (text !== null && text !== undefined) {
+            const cleanedText = text.trim();
+            if (!cleanedText || noiseTokens.some(token => cleanedText.toLowerCase().includes(token))) {
+              console.log(`[STT ${prov}] Ignoring noise/silence token: "${cleanedText}"`);
+              return null;
+            }
+            recordUsage({ stt_provider: prov, stt_seconds: buffer.length / 8000 });
+            return cleanedText;
+          }
+        } catch (provErr) {
+          console.warn(`[STT ${prov}] Transcription failed: ${provErr.message}. Trying next available provider...`);
         }
-        return cleanedText;
-      } else if (provider === 'sarvam_ai') {
-        const apiKey = userSettings?.sarvam_ai_api_key;
-        const wavBuffer = this.createUlawWav(buffer);
-        sarvamService.saveAudio(wavBuffer, `inbound_${Date.now()}.wav`).catch(() => {});
-        const text = await sarvamService.transcribeAudio(wavBuffer, apiKey);
-        const cleanedText = text ? text.trim() : '';
-        if (!cleanedText || noiseTokens.some(token => cleanedText.toLowerCase().includes(token))) {
-          console.log(`Ignoring noise/silence token: ${cleanedText}`);
-          return null;
-        }
-        return cleanedText;
-      } else {
-        const apiKey = userSettings?.elevenlabs_api_key;
-        const wavBuffer = this.createUlawWav(buffer);
-        elevenLabsService.saveAudio(wavBuffer, `inbound_${Date.now()}.mp3`).catch(() => {});
-        const languageCode = agent?.language ? String(agent.language).split(/[-_]/)[0].toLowerCase() : null;
-        const text = await elevenLabsService.transcribeAudio(wavBuffer, apiKey, languageCode);
-        const cleanedText = text ? text.trim() : '';
-        if (!cleanedText || noiseTokens.some(token => cleanedText.toLowerCase().includes(token))) {
-          console.log(`Ignoring noise/silence token: ${cleanedText}`);
-          return null;
-        }
-        return cleanedText;
       }
+
+      return "";
     } catch (err) {
       console.error('STT Error:', err);
       return "";

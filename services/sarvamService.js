@@ -119,7 +119,7 @@ class SarvamService {
         (typeof error.response.data === 'string' ? error.response.data : JSON.stringify(error.response.data)) :
         error.message;
       console.error('Sarvam STT Error:', errorMessage);
-      return '';
+      throw new Error(`Sarvam STT Failed: ${errorMessage}`);
     }
   }
 

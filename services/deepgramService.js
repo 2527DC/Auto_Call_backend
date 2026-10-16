@@ -77,7 +77,7 @@ class DeepgramService {
         (typeof error.response.data === 'string' ? error.response.data : JSON.stringify(error.response.data)) :
         error.message;
       console.error('Deepgram STT Error:', errorMessage);
-      return '';
+      throw new Error(`Deepgram STT Failed: ${errorMessage}`);
     }
   }
 

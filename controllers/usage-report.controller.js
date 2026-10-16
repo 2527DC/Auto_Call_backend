@@ -3,7 +3,7 @@
 const { db } = require('../models');
 const { Call, User, CreditUsage, PaymentHistory, Plan, Role, Setting, SMSLog, SmsMessage, WhatsAppLog, AIModel } = db;
 
-const { callCost, typicalMinuteCost } = require('../utils/callCost');
+const { billedMinutes, callCost, typicalMinuteCost } = require('../utils/callCost');
 const creditService = require('../services/creditService');
 
 const round2 = (n) => Math.round(n * 100) / 100;
@@ -309,11 +309,11 @@ exports.getAiInsights = async (req, res) => {
 
     const rates = (await Setting.findOne()) || {};
     const calls = await Call.find(filter)
-      .select('user_id agent_id duration usage credits_used created_at')
+      .select('user_id agent_id campaign_id from_number to_number direction duration status usage telephony_provider credits_used created_at')
       .populate('user_id', 'name email')
       .populate({
         path: 'agent_id',
-        select: 'name voice_provider llm_model',
+        select: 'name voice_provider llm_model telephony_provider',
         populate: { path: 'llm_model', select: 'name display_name provider model_id' }
       })
       .sort({ created_at: -1 })
@@ -328,16 +328,22 @@ exports.getAiInsights = async (req, res) => {
     let totalSttSeconds = 0;
     let totalTtsChars = 0;
     let totalAiCalls = 0;
+    let totalTelephonySeconds = 0;
+    let totalTelephonyMinutes = 0;
+    let costTelephony = 0;
     let costLlm = 0;
     let costStt = 0;
     let costTts = 0;
 
     const modelsMap = new Map();
+    const phoneNumbersMap = new Map();
     const providersMap = {
       openai: { provider: 'OpenAI', service: 'LLM (Intelligence)', usage_label: 'Tokens', usage_value: 0, cost: 0 },
       deepgram: { provider: 'Deepgram', service: 'STT & TTS (Voice Engine)', usage_label: 'Minutes / Chars', usage_value: 0, cost: 0 },
       sarvam_ai: { provider: 'Sarvam AI', service: 'Indic STT / TTS', usage_label: 'Minutes / Chars', usage_value: 0, cost: 0 },
       elevenlabs: { provider: 'ElevenLabs', service: 'High-Fidelity TTS', usage_label: 'Characters', usage_value: 0, cost: 0 },
+      plivo: { provider: 'Plivo', service: 'Telephony Carrier (Voice Calls)', usage_label: 'Minutes', usage_value: 0, cost: 0 },
+      twilio: { provider: 'Twilio', service: 'Telephony Carrier (Voice Calls)', usage_label: 'Minutes', usage_value: 0, cost: 0 },
     };
     const clientsMap = new Map();
     const timelineMap = new Map();
@@ -347,7 +353,7 @@ exports.getAiInsights = async (req, res) => {
     const dayMs = 24 * 60 * 60 * 1000;
     for (let d = new Date(from); d <= to; d = new Date(d.getTime() + dayMs)) {
       const dayKey = d.toISOString().slice(0, 10);
-      timelineMap.set(dayKey, { date: dayKey, tokens: 0, input_tokens: 0, output_tokens: 0, cost: 0, calls: 0 });
+      timelineMap.set(dayKey, { date: dayKey, tokens: 0, input_tokens: 0, output_tokens: 0, cost: 0, calls: 0, ai_cost: 0, telephony_cost: 0 });
     }
 
     const discoveredModels = new Set();
@@ -365,11 +371,25 @@ exports.getAiInsights = async (req, res) => {
       const sttProvider = call.usage?.stt_provider || call.agent_id?.voice_provider || 'deepgram';
       const ttsProvider = call.usage?.tts_provider || call.agent_id?.voice_provider || 'deepgram';
 
+      // Telephony Provider identification (handles BYO provider credentials & defaults)
+      const rawTelProv = (call.usage?.telephony_provider || call.agent_id?.telephony_provider || 'plivo').toLowerCase();
+      let normTelProv = 'plivo';
+      if (rawTelProv.includes('twilio')) {
+        normTelProv = 'twilio';
+      } else if (rawTelProv.includes('sip')) {
+        normTelProv = 'sip';
+      } else if (rawTelProv.includes('whatsapp')) {
+        normTelProv = 'meta_whatsapp';
+      } else {
+        normTelProv = 'plivo';
+      }
+
       const inTokens = call.usage?.llm_input_tokens || 0;
       const outTokens = call.usage?.llm_output_tokens || 0;
       const callTokens = inTokens + outTokens;
       const sttSec = call.usage?.stt_seconds || 0;
       const ttsChars = call.usage?.tts_characters || 0;
+      const callDuration = call.duration || 0;
 
       const pricing = getModelPricing(rawModel, rates);
       const callLlmCost = (inTokens / 1e6) * pricing.inputPer1M + (outTokens / 1e6) * pricing.outputPer1M;
@@ -380,9 +400,24 @@ exports.getAiInsights = async (req, res) => {
       const ttsRate = (rates[`cost_tts_per_1k_chars_${ttsProvider}`] || (ttsProvider === 'elevenlabs' ? 3.88 : (ttsProvider === 'sarvam_ai' ? 3.0 : 1.46))) / 1000;
       const callTtsCost = ttsChars * ttsRate;
 
-      const callTotalAiCost = callLlmCost + callSttCost + callTtsCost;
+      // Telephony billing logic: Plivo charges per 30s increments, others per minute
+      const telBilledMins = billedMinutes(callDuration, normTelProv);
+      const telRate = normTelProv === 'twilio'
+        ? (rates.cost_telephony_per_minute_twilio || 1.10)
+        : (normTelProv === 'sip'
+          ? (rates.cost_telephony_per_minute_sip || 0.20)
+          : (normTelProv === 'meta_whatsapp'
+            ? (rates.cost_whatsapp_per_minute || 0.30)
+            : (rates.cost_telephony_per_minute || 0.38)));
+      const callTelephonyCost = telBilledMins * telRate;
 
-      totalCost += callTotalAiCost;
+      const callTotalAiCost = callLlmCost + callSttCost + callTtsCost;
+      const callTotalCost = callTotalAiCost + callTelephonyCost;
+
+      totalCost += callTotalCost;
+      costTelephony += callTelephonyCost;
+      totalTelephonySeconds += callDuration;
+      totalTelephonyMinutes += telBilledMins;
       totalTokens += callTokens;
       totalInputTokens += inTokens;
       totalOutputTokens += outTokens;
@@ -432,16 +467,82 @@ exports.getAiInsights = async (req, res) => {
         }
       }
 
+      // Telephony provider breakdown (Plivo, Twilio, SIP)
+      if (!providersMap[normTelProv]) {
+        providersMap[normTelProv] = {
+          provider: normTelProv === 'sip' ? 'SIP Trunk' : (normTelProv === 'meta_whatsapp' ? 'Meta WhatsApp' : normTelProv.toUpperCase()),
+          service: 'Telephony Carrier (Voice Calls)',
+          usage_label: 'Minutes',
+          usage_value: 0,
+          cost: 0,
+        };
+      }
+      providersMap[normTelProv].usage_value += telBilledMins;
+      providersMap[normTelProv].cost += callTelephonyCost;
+
+      // Phone Number breakdown
+      let rawPhone = null;
+      if (call.direction === 'inbound') {
+        rawPhone = call.to_number || call.from_number;
+      } else {
+        rawPhone = call.from_number || call.to_number;
+      }
+      if (!rawPhone || rawPhone === 'unknown') {
+        rawPhone = 'Direct / WebRTC';
+      }
+      let cleanPhone = String(rawPhone).trim();
+      if (/^\d{10,15}$/.test(cleanPhone)) {
+        cleanPhone = `+${cleanPhone}`;
+      }
+
+      const telProviderLabel = normTelProv === 'plivo' ? 'Plivo' : (normTelProv === 'twilio' ? 'Twilio' : (normTelProv === 'sip' ? 'SIP Trunk' : 'Meta WhatsApp'));
+      if (!phoneNumbersMap.has(cleanPhone)) {
+        phoneNumbersMap.set(cleanPhone, {
+          phone_number: cleanPhone,
+          provider: telProviderLabel,
+          calls_count: 0,
+          inbound_calls: 0,
+          outbound_calls: 0,
+          duration_seconds: 0,
+          billed_minutes: 0,
+          telephony_cost: 0,
+          ai_cost: 0,
+          total_cost: 0,
+          agent_names: new Set(),
+          client_names: new Set(),
+        });
+      }
+      const pRow = phoneNumbersMap.get(cleanPhone);
+      pRow.calls_count += 1;
+      if (call.direction === 'inbound') {
+        pRow.inbound_calls += 1;
+      } else {
+        pRow.outbound_calls += 1;
+      }
+      pRow.duration_seconds += callDuration;
+      pRow.billed_minutes += telBilledMins;
+      pRow.telephony_cost += callTelephonyCost;
+      pRow.ai_cost += callTotalAiCost;
+      pRow.total_cost += callTotalCost;
+      if (call.agent_id?.name) {
+        pRow.agent_names.add(call.agent_id.name);
+      }
+      if (call.user_id?.name) {
+        pRow.client_names.add(call.user_id.name);
+      }
+
       // Timeline breakdown
       const callDay = (call.created_at ? new Date(call.created_at) : new Date()).toISOString().slice(0, 10);
       if (!timelineMap.has(callDay)) {
-        timelineMap.set(callDay, { date: callDay, tokens: 0, input_tokens: 0, output_tokens: 0, cost: 0, calls: 0 });
+        timelineMap.set(callDay, { date: callDay, tokens: 0, input_tokens: 0, output_tokens: 0, cost: 0, calls: 0, ai_cost: 0, telephony_cost: 0 });
       }
       const tRow = timelineMap.get(callDay);
       tRow.tokens += callTokens;
       tRow.input_tokens += inTokens;
       tRow.output_tokens += outTokens;
-      tRow.cost += callTotalAiCost;
+      tRow.cost += callTotalCost;
+      tRow.ai_cost = (tRow.ai_cost || 0) + callTotalAiCost;
+      tRow.telephony_cost = (tRow.telephony_cost || 0) + callTelephonyCost;
       tRow.calls += 1;
 
       // Client breakdown
@@ -457,6 +558,9 @@ exports.getAiInsights = async (req, res) => {
           output_tokens: 0,
           stt_minutes: 0,
           tts_characters: 0,
+          telephony_minutes: 0,
+          telephony_cost: 0,
+          ai_cost: 0,
           cost: 0,
         });
       }
@@ -467,7 +571,10 @@ exports.getAiInsights = async (req, res) => {
       cRow.output_tokens += outTokens;
       cRow.stt_minutes += sttSec / 60;
       cRow.tts_characters += ttsChars;
-      cRow.cost += callTotalAiCost;
+      cRow.telephony_minutes += telBilledMins;
+      cRow.telephony_cost += callTelephonyCost;
+      cRow.ai_cost += callTotalAiCost;
+      cRow.cost += callTotalCost;
 
       // Recent calls (up to 50)
       if (recentCalls.length < 50) {
@@ -483,7 +590,13 @@ exports.getAiInsights = async (req, res) => {
             id: call.agent_id ? String(call.agent_id._id || call.agent_id) : null,
             name: call.agent_id?.name || 'Direct / Flow Call',
           },
-          duration: call.duration || 0,
+          phone_number: cleanPhone,
+          direction: call.direction || 'outbound',
+          telephony_provider: telProviderLabel,
+          duration: callDuration,
+          telephony_cost: round2(callTelephonyCost),
+          ai_cost: round2(callTotalAiCost),
+          cost: round2(callTotalCost),
           model: rawModel,
           provider: llmProvider,
           input_tokens: inTokens,
@@ -493,7 +606,6 @@ exports.getAiInsights = async (req, res) => {
           tts_provider: ttsProvider,
           stt_seconds: round2(sttSec),
           tts_characters: ttsChars,
-          cost: round2(callTotalAiCost),
         });
       }
     }
@@ -506,9 +618,27 @@ exports.getAiInsights = async (req, res) => {
       cost_percentage: totalCost > 0 ? round2((m.cost / totalCost) * 100) : 0,
     })).sort((a, b) => b.total_tokens - a.total_tokens);
 
+    // Format phone numbers array
+    const phoneNumbers = Array.from(phoneNumbersMap.values()).map((p) => ({
+      phone_number: p.phone_number,
+      provider: p.provider,
+      calls_count: p.calls_count,
+      inbound_calls: p.inbound_calls,
+      outbound_calls: p.outbound_calls,
+      duration_seconds: p.duration_seconds,
+      billed_minutes: round2(p.billed_minutes),
+      telephony_cost: round2(p.telephony_cost),
+      ai_cost: round2(p.ai_cost),
+      total_cost: round2(p.total_cost),
+      cost_percentage: totalCost > 0 ? round2((p.total_cost / totalCost) * 100) : 0,
+      agents: Array.from(p.agent_names).join(', ') || 'Direct Call',
+      clients: Array.from(p.client_names).join(', ') || 'N/A',
+    })).sort((a, b) => b.total_cost - a.total_cost);
+
     // Format providers array
     const providers = Object.values(providersMap).map((p) => ({
       ...p,
+      usage_value: round2(p.usage_value),
       cost: round2(p.cost),
       percentage: totalCost > 0 ? round2((p.cost / totalCost) * 100) : 0,
     })).sort((a, b) => b.cost - a.cost);
@@ -517,6 +647,9 @@ exports.getAiInsights = async (req, res) => {
     const clients = Array.from(clientsMap.values()).map((c) => ({
       ...c,
       stt_minutes: round2(c.stt_minutes),
+      telephony_minutes: round2(c.telephony_minutes || 0),
+      telephony_cost: round2(c.telephony_cost || 0),
+      ai_cost: round2(c.ai_cost || 0),
       cost: round2(c.cost),
       tokens_percentage: totalTokens > 0 ? round2((c.total_tokens / totalTokens) * 100) : 0,
       cost_percentage: totalCost > 0 ? round2((c.cost / totalCost) * 100) : 0,
@@ -524,7 +657,12 @@ exports.getAiInsights = async (req, res) => {
 
     // Format timeline array sorted by date
     const timeline = Array.from(timelineMap.values())
-      .map((t) => ({ ...t, cost: round2(t.cost) }))
+      .map((t) => ({
+        ...t,
+        cost: round2(t.cost),
+        ai_cost: round2(t.ai_cost || 0),
+        telephony_cost: round2(t.telephony_cost || 0),
+      }))
       .sort((a, b) => a.date.localeCompare(b.date));
 
     // Also get active AI models from database to offer in filters
@@ -547,10 +685,14 @@ exports.getAiInsights = async (req, res) => {
       },
       summary: {
         total_cost: round2(totalCost),
+        total_ai_cost: round2(costLlm + costStt + costTts),
+        total_telephony_cost: round2(costTelephony),
+        total_telephony_minutes: round2(totalTelephonyMinutes),
         cost_breakdown: {
           llm: round2(costLlm),
           stt: round2(costStt),
           tts: round2(costTts),
+          telephony: round2(costTelephony),
         },
         total_tokens: totalTokens,
         input_tokens: totalInputTokens,
@@ -560,11 +702,13 @@ exports.getAiInsights = async (req, res) => {
         total_tts_chars: totalTtsChars,
         top_model: models[0]?.model_id || 'N/A',
         top_provider: providers[0]?.provider || 'N/A',
+        top_phone_number: phoneNumbers[0]?.phone_number || 'N/A',
         avg_tokens_per_call: totalAiCalls > 0 ? Math.round(totalTokens / totalAiCalls) : 0,
         avg_cost_per_call: totalAiCalls > 0 ? round2(totalCost / totalAiCalls) : 0,
       },
       models,
       providers,
+      phone_numbers: phoneNumbers,
       timeline,
       clients,
       recent_calls: recentCalls,

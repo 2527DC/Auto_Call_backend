@@ -583,7 +583,17 @@ class VoiceAutomationService extends EventEmitter {
   }
 
   greetingText(agent) {
-    return agent.first_message || `Hello! I'm ${agent.name}. How can I help you today?`;
+    if (agent?.first_message && agent.first_message.trim()) {
+      return agent.first_message.trim();
+    }
+    const lang = String(agent?.language || 'en').toLowerCase().trim();
+    if (lang === 'kn') {
+      return `ನಮಸ್ಕಾರ! ನಾನು ${agent?.name || 'ಸಹಾಯಕ'}. ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಬಹುದು?`;
+    }
+    if (lang === 'hi') {
+      return `नमस्ते! मैं ${agent?.name || 'सहायक'} हूँ। मैं आपकी क्या सहायता कर सकता हूँ?`;
+    }
+    return `Hello! I'm ${agent?.name || 'assistant'}. How can I help you today?`;
   }
 
   // How long an outgoing call waits for the customer's hello before greeting
@@ -1638,9 +1648,34 @@ class VoiceAutomationService extends EventEmitter {
 
           let systemPrompt = currentAgent.system_prompt || currentAgent.personality || '';
 
+          const lang = String(currentAgent.language || 'en').toLowerCase().trim();
+          let langInstruction = '';
+          if (lang === 'kn') {
+            langInstruction = `LANGUAGE REQUIREMENT (CRITICAL):
+- The official language of this call is KANNADA (ಕನ್ನಡ).
+- You MUST speak and respond in fluent KANNADA (ಕನ್ನಡ) using Kannada script.
+- Even if the caller speaks English, Kanglish, or asks questions with English words (like "cycle", "price", "model"), ALWAYS respond fluently in KANNADA (ಕನ್ನಡ).
+- Do not reply in English unless the caller explicitly asks you to switch to English.
+- Keep your Kannada polite, clear, natural, and conversational for a phone call.`;
+          } else if (lang === 'hi') {
+            langInstruction = `LANGUAGE REQUIREMENT (CRITICAL):
+- The official language of this call is HINDI (हिन्दी).
+- You MUST speak and respond in fluent HINDI (हिन्दी) using Devanagari script.
+- Even if the caller speaks English, Hinglish, or asks questions with English words, ALWAYS respond fluently in HINDI (हिन्दी).
+- Do not reply in English unless the caller explicitly asks you to switch to English.
+- Keep your Hindi polite, clear, natural, and conversational for a phone call.`;
+          } else if (lang !== 'en') {
+            langInstruction = `LANGUAGE REQUIREMENT:
+- You must converse and reply in ${lang.toUpperCase()} by default.`;
+          }
+
+          if (langInstruction) {
+            systemPrompt += `\n\n${langInstruction}`;
+          }
+
           const kbContent = stream.resolvedKnowledge || await this.resolveAgentKnowledge(currentAgent, stream);
           if (kbContent) {
-            systemPrompt += `\n\nKNOWLEDGE BASE (BUSINESS DATA, PRODUCTS, PRICES, & POLICIES):\n${kbContent}\n\nKNOWLEDGE BASE INSTRUCTIONS:\n- Answer caller queries accurately using the knowledge base provided above.\n- Provide specific prices, specs, models, offers, and warranty/service terms from the knowledge base.\n- If a specific product or detail requested is not in the knowledge base, do not invent information; tell the caller politely that the team will confirm details on WhatsApp or follow up.\n- Answer in the same language or mix of languages (e.g. English, Kannada, Hindi) the caller speaks in.`;
+            systemPrompt += `\n\nKNOWLEDGE BASE (BUSINESS DATA, PRODUCTS, PRICES, & POLICIES):\n${kbContent}\n\nKNOWLEDGE BASE INSTRUCTIONS:\n- Answer caller queries accurately using the knowledge base provided above.\n- Provide specific prices, specs, models, offers, and warranty/service terms from the knowledge base.\n- If a specific product or detail requested is not in the knowledge base, do not invent information; tell the caller politely that the team will confirm details on WhatsApp or follow up.`;
           }
 
           systemPrompt += `\n\n${CALL_HANDLING_RULES}`;

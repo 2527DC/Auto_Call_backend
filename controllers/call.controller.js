@@ -6,6 +6,8 @@ const UserSettings = db.UserSettings;
 const Agent = db.Agent;
 const PhoneNumber = db.PhoneNumber;
 const Contact = db.Contact;
+const Setting = db.Setting;
+const { billedMinutes, getModelPricing } = require('../utils/callCost');
 const { findContactByPhone, findOrCreateContact } = require('../utils/phone');
 const outcomeService = require('../services/outcomeService');
 const twilioService = require('../services/twilioService');
@@ -840,6 +842,177 @@ exports.handlePlivoInboundCall = async (req, res) => {
   } catch (error) {
     console.error('Plivo Inbound Call Error:', error);
     res.status(500).send('Internal Server Error');
+  }
+};
+
+exports.generatePlivoTransferXML = async (req, res) => {
+  try {
+    const to = req.query.to || req.body?.to;
+    const from = req.query.from || req.body?.from;
+    const actionUrl = `${process.env.APP_URL}/api/calls/plivo-status`;
+    const callerIdAttr = from ? ` callerId="${from}"` : '';
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Dial action="${actionUrl}" method="POST"${callerIdAttr}>
+        <Number>${to}</Number>
+    </Dial>
+</Response>`;
+    res.type('text/xml');
+    res.send(xml);
+  } catch (err) {
+    console.error('Error generating Plivo transfer XML:', err);
+    res.status(500).send('Internal Server Error');
+  }
+};
+
+// GET /api/calls/logs/:id/cost
+// Admin-only breakdown of total cost, telephony charges, STT, TTS, and LLM reasoning.
+exports.getCallCostBreakdown = async (req, res) => {
+  try {
+    const isAdmin = req.user?.roleId?.name === 'super_admin' || req.user?.roleId?.name === 'admin';
+    if (!isAdmin) {
+      return res.status(403).json({ success: false, message: 'Only administrators can view per-call cost breakdown' });
+    }
+
+    const { id } = req.params;
+    const call = await Call.findById(id)
+      .populate('user_id', 'name email')
+      .populate({
+        path: 'agent_id',
+        select: 'name voice_provider llm_model telephony_provider',
+        populate: { path: 'llm_model', select: 'name display_name provider model_id' }
+      })
+      .populate('campaign_id', 'name')
+      .lean();
+
+    if (!call) {
+      return res.status(404).json({ success: false, message: 'Call not found' });
+    }
+
+    const rates = (await Setting.findOne()) || {};
+
+    const callDuration = call.duration || 0;
+    const rawModel = call.usage?.llm_model || call.agent_id?.llm_model?.model_id || 'gpt-4o-mini';
+    const llmProvider = call.usage?.llm_provider || call.agent_id?.llm_model?.provider || 'openai';
+    const sttProvider = call.usage?.stt_provider || call.agent_id?.voice_provider || 'deepgram';
+    const ttsProvider = call.usage?.tts_provider || call.agent_id?.voice_provider || 'deepgram';
+
+    const rawTelProv = (call.usage?.telephony_provider || call.agent_id?.telephony_provider || 'plivo').toLowerCase();
+    let normTelProv = 'plivo';
+    if (rawTelProv.includes('twilio')) {
+      normTelProv = 'twilio';
+    } else if (rawTelProv.includes('sip')) {
+      normTelProv = 'sip';
+    } else if (rawTelProv.includes('whatsapp')) {
+      normTelProv = 'meta_whatsapp';
+    } else {
+      normTelProv = 'plivo';
+    }
+
+    const inTokens = call.usage?.llm_input_tokens || 0;
+    const outTokens = call.usage?.llm_output_tokens || 0;
+    const totalTokens = inTokens + outTokens;
+    const sttSec = call.usage?.stt_seconds || 0;
+    const ttsChars = call.usage?.tts_characters || 0;
+
+    // Pricing rates
+    const pricing = getModelPricing(rawModel, rates);
+    const costLlmInput = (inTokens / 1e6) * pricing.inputPer1M;
+    const costLlmOutput = (outTokens / 1e6) * pricing.outputPer1M;
+    const costLlm = costLlmInput + costLlmOutput;
+
+    const sttRatePerMin = rates[`cost_stt_per_minute_${sttProvider}`] || (sttProvider === 'sarvam_ai' ? 0.5 : 0.42);
+    const costStt = (sttSec / 60) * sttRatePerMin;
+
+    const ttsRatePer1k = rates[`cost_tts_per_1k_chars_${ttsProvider}`] || (ttsProvider === 'elevenlabs' ? 3.88 : (ttsProvider === 'sarvam_ai' ? 3.0 : 1.46));
+    const costTts = (ttsChars / 1000) * ttsRatePer1k;
+
+    const telBilledMins = billedMinutes(callDuration, normTelProv);
+    const telRatePerMin = normTelProv === 'twilio'
+      ? (rates.cost_telephony_per_minute_twilio || 1.10)
+      : (normTelProv === 'sip'
+        ? (rates.cost_telephony_per_minute_sip || 0.20)
+        : (normTelProv === 'meta_whatsapp'
+          ? (rates.cost_whatsapp_per_minute || 0.30)
+          : (rates.cost_telephony_per_minute || 0.38)));
+    const costTelephony = telBilledMins * telRatePerMin;
+
+    const totalCost = costTelephony + costLlm + costStt + costTts;
+
+    // Determine the phone numbers
+    const inbound = call.direction === 'inbound';
+    const clientNumber = inbound ? call.from_number : call.to_number;
+    const appNumber = inbound ? call.to_number : call.from_number;
+
+    res.json({
+      success: true,
+      data: {
+        call_id: String(call._id),
+        created_at: call.created_at,
+        client: {
+          id: call.user_id ? String(call.user_id._id || call.user_id) : null,
+          name: call.user_id?.name || 'Unknown Client',
+          email: call.user_id?.email || '',
+        },
+        agent: {
+          id: call.agent_id ? String(call.agent_id._id || call.agent_id) : null,
+          name: call.agent_id?.name || 'Direct / Flow Call',
+        },
+        routing: {
+          direction: call.direction || 'outbound',
+          client_number: clientNumber,
+          app_number: appNumber,
+          telephony_provider: normTelProv === 'plivo' ? 'Plivo' : (normTelProv === 'twilio' ? 'Twilio' : (normTelProv === 'sip' ? 'SIP Trunk' : 'Meta WhatsApp')),
+        },
+        duration: {
+          seconds: callDuration,
+          formatted: `${Math.floor(callDuration / 60)}m ${callDuration % 60}s`,
+          billed_minutes: telBilledMins,
+          billing_increment: normTelProv === 'plivo' ? '30-second increment' : '60-second increment',
+        },
+        credits_used: call.credits_used || 0,
+        total_cost: Math.round(totalCost * 100) / 100,
+        total_ai_cost: Math.round((costLlm + costStt + costTts) * 100) / 100,
+        currency: 'INR (₹)',
+        breakdown: {
+          telephony: {
+            provider: normTelProv === 'plivo' ? 'Plivo' : (normTelProv === 'twilio' ? 'Twilio' : (normTelProv === 'sip' ? 'SIP Trunk' : 'Meta WhatsApp')),
+            billed_minutes: telBilledMins,
+            rate_per_minute: telRatePerMin,
+            cost: Math.round(costTelephony * 100) / 100,
+            percent: totalCost > 0 ? Math.round((costTelephony / totalCost) * 100) : 0,
+          },
+          llm: {
+            provider: llmProvider,
+            model: rawModel,
+            input_tokens: inTokens,
+            output_tokens: outTokens,
+            total_tokens: totalTokens,
+            rate_input_1m: pricing.inputPer1M,
+            rate_output_1m: pricing.outputPer1M,
+            cost: Math.round(costLlm * 100) / 100,
+            percent: totalCost > 0 ? Math.round((costLlm / totalCost) * 100) : 0,
+          },
+          stt: {
+            provider: sttProvider,
+            seconds: Math.round(sttSec * 100) / 100,
+            rate_per_minute: sttRatePerMin,
+            cost: Math.round(costStt * 100) / 100,
+            percent: totalCost > 0 ? Math.round((costStt / totalCost) * 100) : 0,
+          },
+          tts: {
+            provider: ttsProvider,
+            characters: ttsChars,
+            rate_per_1k: ttsRatePer1k,
+            cost: Math.round(costTts * 100) / 100,
+            percent: totalCost > 0 ? Math.round((costTts / totalCost) * 100) : 0,
+          },
+        },
+      },
+    });
+  } catch (error) {
+    console.error('Get call cost breakdown error:', error);
+    res.status(500).json({ success: false, message: 'Failed to calculate call cost breakdown' });
   }
 };
 

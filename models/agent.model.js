@@ -162,6 +162,11 @@ const AgentSchema = new Schema(
         type: Schema.Types.ObjectId,
         ref: 'TeamMember',
         default: null
+      },
+      transfer_phone_number: {
+        type: String,
+        default: null,
+        trim: true
       }
     },
     max_call_duration: {

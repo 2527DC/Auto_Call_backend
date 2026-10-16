@@ -35,4 +35,16 @@ const typicalMinuteCost = (rates, voiceProvider) => {
   return Object.values(callCost({ duration: 60, usage }, rates)).reduce((a, b) => a + b, 0);
 };
 
-module.exports = { billedMinutes, callCost, typicalMinuteCost, USAGE_PROFILES };
+// Rate per 1M tokens for popular LLM models in INR
+const getModelPricing = (modelId, rates) => {
+  const baseIn = rates?.cost_llm_input_per_1m_tokens || 14.55;
+  const baseOut = rates?.cost_llm_output_per_1m_tokens || 58.2;
+  const id = (modelId || '').toLowerCase();
+  if (id.includes('gpt-4o-mini')) return { inputPer1M: baseIn, outputPer1M: baseOut };
+  if (id.includes('gpt-4o') || id.includes('gpt-4-turbo')) return { inputPer1M: 215, outputPer1M: 860 };
+  if (id.includes('claude-3-5-sonnet')) return { inputPer1M: 260, outputPer1M: 1300 };
+  if (id.includes('claude-3-haiku')) return { inputPer1M: 22, outputPer1M: 110 };
+  return { inputPer1M: baseIn, outputPer1M: baseOut };
+};
+
+module.exports = { billedMinutes, callCost, typicalMinuteCost, getModelPricing, USAGE_PROFILES };

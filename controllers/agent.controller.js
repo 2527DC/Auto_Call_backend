@@ -163,8 +163,10 @@ exports.createAgent = async (req, res) => {
           if (!member || !member.phone_number) {
             return res.status(400).json({ success: false, message: 'Invalid team member selected or member has no phone number' });
           }
+        } else if (agentData.transfer_to_human.transfer_phone_number && String(agentData.transfer_to_human.transfer_phone_number).trim()) {
+          agentData.transfer_to_human.transfer_phone_number = String(agentData.transfer_to_human.transfer_phone_number).trim();
         } else {
-          return res.status(400).json({ success: false, message: 'Team member is required when transfer to human is enabled' });
+          return res.status(400).json({ success: false, message: 'Team member or transfer phone number is required when transfer to human is enabled' });
         }
       }
       if (agentData.transfer_to_human.transfer_keywords && !Array.isArray(agentData.transfer_to_human.transfer_keywords)) {
@@ -297,8 +299,10 @@ exports.updateAgent = async (req, res) => {
           if (!member || !member.phone_number) {
             return res.status(400).json({ success: false, message: 'Invalid team member selected or member has no phone number' });
           }
+        } else if (updateData.transfer_to_human.transfer_phone_number && String(updateData.transfer_to_human.transfer_phone_number).trim()) {
+          updateData.transfer_to_human.transfer_phone_number = String(updateData.transfer_to_human.transfer_phone_number).trim();
         } else {
-          return res.status(400).json({ success: false, message: 'Team member is required when transfer to human is enabled' });
+          return res.status(400).json({ success: false, message: 'Team member or transfer phone number is required when transfer to human is enabled' });
         }
       }
       if (updateData.transfer_to_human.transfer_keywords && !Array.isArray(updateData.transfer_to_human.transfer_keywords)) {

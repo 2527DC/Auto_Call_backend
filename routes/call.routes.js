@@ -15,12 +15,15 @@ router.post('/inbound', callController.handleInboundCall);
 router.post('/plivo-xml', callController.generatePlivoXML);
 router.post('/plivo-status', callController.handlePlivoStatusCallback);
 router.post('/plivo-inbound', callController.handlePlivoInboundCall);
+router.all('/plivo-transfer-xml', callController.generatePlivoTransferXML);
 
 router.use(authenticate);
 
 router.post('/place', checkPermission('create.calls'), callController.placeCall);
 router.get('/logs', checkPermission('activity.calls'), callController.getCallLogs);
 router.get('/logs/export', checkPermission('activity.calls'), callController.exportCallLogs);
+router.get('/logs/:id/cost', checkPermission('activity.calls'), callController.getCallCostBreakdown);
+router.get('/:id/cost', checkPermission('activity.calls'), callController.getCallCostBreakdown);
 router.get('/:id/recording', checkPermission('view.calls'), callController.getCallRecording);
 
 

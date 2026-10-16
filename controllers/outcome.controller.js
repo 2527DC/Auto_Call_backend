@@ -152,7 +152,9 @@ exports.setCallOutcome = async (req, res) => {
 exports.reanalyzeCall = async (req, res) => {
   try {
     if (!isId(req.params.id)) return fail(res, 404, 'Call not found');
-    const call = await Call.findOne({ _id: req.params.id, user_id: ownerOf(req) }).select('_id status outcome.state').lean();
+    const isAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin';
+    const callQuery = isAdmin ? { _id: req.params.id } : { _id: req.params.id, user_id: ownerOf(req) };
+    const call = await Call.findOne(callQuery).select('_id status outcome.state').lean();
     if (!call) return fail(res, 404, 'Call not found');
     if (call.outcome?.state === 'processing') return fail(res, 409, 'This call is being analysed right now');
     const outcome = await outcomeService.process(call._id, { force: true });

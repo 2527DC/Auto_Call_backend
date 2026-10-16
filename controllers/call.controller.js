@@ -556,8 +556,19 @@ exports.handleRecordingCallback = async (req, res) => {
 
 // Filters shared by the Call Activity list and its export.
 const callLogQuery = (req) => {
-  const { search = '', status, direction, outcome, reached, sentiment, agent_id, campaign_id, from, to } = req.query;
-  const query = { user_id: req.user.id };
+  const { search = '', status, direction, outcome, reached, sentiment, agent_id, campaign_id, from, to, user_id, client_id } = req.query;
+  const isAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin';
+  const query = {};
+
+  if (!isAdmin) {
+    query.user_id = req.user.id;
+  } else {
+    const filterUser = user_id || client_id;
+    if (filterUser && filterUser !== 'all' && db.mongoose.Types.ObjectId.isValid(filterUser)) {
+      query.user_id = filterUser;
+    }
+  }
+
   const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   if (search) {
     const rx = { $regex: escapeRegex(search), $options: 'i' };
@@ -601,6 +612,7 @@ exports.getCallLogs = async (req, res) => {
     const skip = (page - 1) * limit;
 
     const logs = await Call.find(query)
+      .populate('user_id', 'name email company phone_number')
       .populate('flow_id', 'name')
       .populate('agent_id', 'name')
       .populate('campaign_id', 'name')
@@ -641,24 +653,33 @@ const linkNewCaller = (callLog, userId, from) => {
 exports.exportCallLogs = async (req, res) => {
   try {
     const { toCsv, istDateTime } = require('../utils/csv');
+    const isAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin';
     const calls = await Call.find(callLogQuery(req))
       .sort({ created_at: -1 })
       .limit(10000)
+      .populate('user_id', 'name email company')
       .populate('agent_id', 'name')
       .populate('campaign_id', 'name')
       .populate('contact_id', 'first_name last_name')
       .select('-transcript -execution_logs')
       .lean();
     const detailKeys = [...new Set(calls.flatMap(c => Object.keys(c.outcome?.details || {})))];
-    const rows = [['Date (IST)', 'Direction', 'Number', 'Name', 'Agent', 'Campaign', 'Status', 'Duration (s)', 'Outcome', 'Summary', 'Sentiment', 'Follow-up', 'Recording', ...detailKeys]];
+    const headers = ['Date (IST)'];
+    if (isAdmin) headers.push('Client');
+    headers.push('Direction', 'Number', 'Name', 'Agent', 'Campaign', 'Status', 'Duration (s)', 'Outcome', 'Summary', 'Sentiment', 'Follow-up', 'Recording', ...detailKeys);
+    const rows = [headers];
     for (const c of calls) {
       const name = [c.contact_id?.first_name, c.contact_id?.last_name].filter(Boolean).join(' ') || c.lead_name || '';
-      rows.push([
-        istDateTime(c.created_at), c.direction, c.direction === 'inbound' ? c.from_number : c.to_number, name,
+      const clientName = c.user_id?.name || c.user_id?.email || '';
+      const row = [istDateTime(c.created_at)];
+      if (isAdmin) row.push(clientName);
+      row.push(
+        c.direction, c.direction === 'inbound' ? c.from_number : c.to_number, name,
         c.agent_id?.name || '', c.campaign_id?.name || '', c.status, c.duration || 0,
         c.outcome?.label || '', c.outcome?.summary || '', c.outcome?.sentiment || '', istDateTime(c.outcome?.follow_up?.at),
         c.recording_url || '', ...detailKeys.map(k => c.outcome?.details?.[k])
-      ]);
+      );
+      rows.push(row);
     }
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="calls-${new Date().toISOString().slice(0, 10)}.csv"`);
@@ -761,13 +782,35 @@ exports.getCallRecording = async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.id;
+    const isAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin';
 
-    const call = await Call.findOne({ _id: id, user_id: userId });
+    const call = await Call.findOne(isAdmin ? { _id: id } : { _id: id, user_id: userId });
     if (!call || !call.recording_url) {
       return res.status(404).json({ success: false, message: 'Recording not found' });
     }
 
-    const settings = await UserSettings.findOne({ user: userId });
+    // Direct streaming for non-Twilio recordings (Plivo / S3 / public media URLs)
+    if (!call.recording_url.includes('api.twilio.com')) {
+      try {
+        const response = await axios({
+          method: 'get',
+          url: call.recording_url,
+          responseType: 'stream'
+        });
+        res.setHeader('Content-Type', response.headers['content-type'] || 'audio/mpeg');
+        return response.data.pipe(res);
+      } catch (streamErr) {
+        console.warn('Direct stream failed, redirecting to recording_url:', streamErr.message);
+        return res.redirect(call.recording_url);
+      }
+    }
+
+    // Twilio recordings requiring HTTP Basic Auth
+    const targetUserId = call.user_id || userId;
+    let settings = await UserSettings.findOne({ user: targetUserId });
+    if (!settings || !settings.twilio_account_sid || !settings.twilio_auth_token) {
+      settings = await UserSettings.findOne({ user: userId });
+    }
     if (!settings || !settings.twilio_account_sid || !settings.twilio_auth_token) {
       return res.status(400).json({ success: false, message: 'Twilio credentials not configured' });
     }

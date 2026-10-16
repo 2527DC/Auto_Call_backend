@@ -298,7 +298,11 @@ class VoiceAutomationService extends EventEmitter {
       const now = new Date();
       call.status = 'completed';
       call.ended_at = now;
-      if (answeredAt || call.started_at) {
+      if (isObj && streamOrSid.explicitDuration) {
+        call.duration = streamOrSid.explicitDuration;
+      } else if (call.duration && call.duration > 0 && Math.abs(call.duration - Math.round((now.getTime() - (answeredAt || new Date(call.started_at).getTime())) / 1000)) > 5) {
+        // Keep accurate carrier-reported duration if already recorded
+      } else if (answeredAt || call.started_at) {
         const from = answeredAt || new Date(call.started_at).getTime();
         call.duration = Math.max(1, Math.round((now.getTime() - from) / 1000));
       } else {
@@ -387,6 +391,26 @@ class VoiceAutomationService extends EventEmitter {
     }
     this.activeStreams.delete(streamSid);
     console.log(`Stream stopped: ${streamSid}`);
+  }
+
+  endStreamByCallSid(callSid, { duration = null, endReason = 'caller_hung_up' } = {}) {
+    if (!callSid) return false;
+    for (const [streamSid, stream] of this.activeStreams.entries()) {
+      if (
+        stream.callSid === callSid ||
+        stream.requestUuid === callSid ||
+        (stream.callLogId && String(stream.callLogId) === String(callSid))
+      ) {
+        console.log(`[Stream] Ending active stream ${streamSid} by callSid ${callSid} (reason: ${endReason}, duration: ${duration})`);
+        stream.endReason = endReason;
+        if (duration !== null && duration !== undefined && Number(duration) > 0) {
+          stream.explicitDuration = Number(duration);
+        }
+        this.endStream(streamSid);
+        return true;
+      }
+    }
+    return false;
   }
 
   // True while the agent is thinking or talking, or saying goodbye.
@@ -1080,9 +1104,15 @@ class VoiceAutomationService extends EventEmitter {
             ]);
             const startStream = this.activeStreams.get(streamSid);
             if (startStream) {
-              if (callLog && callSid && callLog.twilio_call_sid !== callSid) {
-                callLog.twilio_call_sid = callSid;
-                await callLog.save().catch(e => console.error('[Stream] Could not update callSid:', e.message));
+              if (callLog) {
+                if (callSid && callLog.twilio_call_sid !== callSid) {
+                  callLog.twilio_call_sid = callSid;
+                }
+                const pickupTime = new Date();
+                callLog.answered_at = pickupTime;
+                callLog.started_at = pickupTime;
+                callLog.status = 'in-progress';
+                await callLog.save().catch(e => console.error('[Stream] Could not update callLog on answer:', e.message));
               }
               startStream.requestUuid = customData.requestUuid;
               startStream.callLogId = callLog?._id;

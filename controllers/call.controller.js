@@ -110,7 +110,7 @@ const buildPlivoStreamXml = ({ flowId, agentId, userId, direction = null, record
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    ${recordXml}<Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000" extraHeaders="${headers}">${appUrl}</Stream>
+    ${recordXml}<Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000" statusCallbackUrl="${process.env.APP_URL}/api/calls/plivo-status" statusCallbackMethod="POST" extraHeaders="${headers}">${appUrl}</Stream>
 </Response>`;
 };
 
@@ -208,9 +208,21 @@ exports.handleStatusCallback = async (req, res) => {
       processCallTranscription(call._id, RecordingUrl);
     }
 
-    if (call && isEnded && call.duration === 0 && call.started_at && call.ended_at) {
-      call.duration = Math.max(0, Math.round((call.ended_at.getTime() - call.started_at.getTime()) / 1000));
+    if (call && isEnded && (!call.duration || call.duration === 0) && call.started_at) {
+      const fromTime = call.answered_at ? new Date(call.answered_at).getTime() : new Date(call.started_at).getTime();
+      const endTime = call.ended_at ? new Date(call.ended_at).getTime() : Date.now();
+      call.duration = Math.max(0, Math.round((endTime - fromTime) / 1000));
       await call.save();
+    }
+
+    if (isEnded) {
+      try {
+        const voiceAutomationService = require('../services/voiceAutomationService');
+        voiceAutomationService.endStreamByCallSid(CallSid, {
+          duration: call?.duration || (CallDuration ? Number(CallDuration) : null),
+          endReason: 'caller_hung_up'
+        });
+      } catch (e) {}
     }
 
     if (call && CallStatus === 'completed' && call.user_id) {
@@ -320,9 +332,23 @@ exports.handlePlivoStatusCallback = async (req, res) => {
     }
 
     if (call && isEnded && (!call.duration || call.duration === 0) && call.started_at) {
+      const fromTime = call.answered_at ? new Date(call.answered_at).getTime() : new Date(call.started_at).getTime();
       const endTime = call.ended_at ? new Date(call.ended_at).getTime() : Date.now();
-      call.duration = Math.max(1, Math.round((endTime - new Date(call.started_at).getTime()) / 1000));
+      call.duration = Math.max(1, Math.round((endTime - fromTime) / 1000));
       await call.save();
+    }
+
+    // Immediately terminate any active media stream for this call so it doesn't linger or wait for idle timeout
+    if (isEnded) {
+      try {
+        const voiceAutomationService = require('../services/voiceAutomationService');
+        voiceAutomationService.endStreamByCallSid(CallUUID || RequestUUID || (call ? String(call._id) : null), {
+          duration: call?.duration || (rawDuration ? Number(rawDuration) : null),
+          endReason: HangupCause || 'caller_hung_up'
+        });
+      } catch (e) {
+        console.error('[Plivo Status] Error stopping stream on hangup:', e.message);
+      }
     }
 
     if (call && call.user_id && req.app.get('io')) {

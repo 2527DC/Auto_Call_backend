@@ -92,18 +92,26 @@ exports.createKnowledgeBase = async (req, res) => {
       fileSize = buffer.length;
       kbData.name = name || fetched.title || url;
       kbData.url = url;
-      kbData.content = fetched.content.substring(0, 5000);
+      kbData.content = fetched.content.substring(0, 50000);
     } else if (type === 'file') {
       if (!req.file) return res.status(400).json({ message: 'File is required' });
       fileSize = req.file.size;
       kbData.name = name || req.file.originalname;
+      if (req.file.mimetype === 'text/plain' || /\.(txt|md|csv|json)$/i.test(req.file.originalname)) {
+        try {
+          const textContent = fs.readFileSync(req.file.path, 'utf8');
+          if (textContent) {
+            kbData.content = textContent.substring(0, 50000);
+          }
+        } catch (e) {}
+      }
     } else if (type === 'text') {
       if (!content) return res.status(400).json({ message: 'Content is required' });
       fileName = `${Date.now()}-text-doc.txt`;
       buffer = Buffer.from(content, 'utf-8');
       fileSize = buffer.length;
       kbData.name = name || 'Untitled Text';
-      kbData.content = content.substring(0, 5000);
+      kbData.content = content.substring(0, 50000);
     } else {
       return res.status(400).json({ message: 'Invalid type' });
     }
@@ -179,7 +187,7 @@ exports.editKnowledgeBase = async (req, res) => {
     let fileSizeDiff = 0;
 
     if (kb.type === 'text' && content) {
-      const newContent = content.substring(0, 5000);
+      const newContent = content.substring(0, 50000);
       const newContentBuffer = Buffer.from(newContent, 'utf-8');
 
       fileSizeDiff = newContentBuffer.length - (kb.file_size || 0);
@@ -201,7 +209,7 @@ exports.editKnowledgeBase = async (req, res) => {
 
       const fetched = await urlFetcherService.fetchContent(updatedUrl);
 
-      const newContent = fetched.content.substring(0, 5000);
+      const newContent = fetched.content.substring(0, 50000);
       const newBuffer = Buffer.from(newContent, 'utf-8');
 
       fileSizeDiff = newBuffer.length - (kb.file_size || 0);
@@ -243,6 +251,15 @@ exports.editKnowledgeBase = async (req, res) => {
       updateData.file_path = filePath;
       updateData.file_size = newFileSize;
       updateData.name = name || req.file.originalname;
+
+      if (req.file.mimetype === 'text/plain' || /\.(txt|md|csv|json)$/i.test(req.file.originalname)) {
+        try {
+          const textContent = fs.readFileSync(req.file.path, 'utf8');
+          if (textContent) {
+            updateData.content = textContent.substring(0, 50000);
+          }
+        } catch (e) {}
+      }
 
       if (kb.file_path) {
         await storageService.deleteFile(kb.file_path);

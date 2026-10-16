@@ -1,5 +1,7 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const EventEmitter = require('events');
 const automationEngine = require('../utils/automationEngine');
 const elevenLabsService = require('./elevenlabsService');
@@ -22,6 +24,7 @@ const FormResponse = db.FormResponse;
 const AppointmentSetting = db.AppointmentSetting;
 const GoogleAccount = db.GoogleAccount;
 const ViolenceWord = db.ViolenceWord;
+const KnowledgeBase = db.KnowledgeBase;
 const axios = require('axios');
 const whatsappService = require('./whatsappService');
 const emailService = require('./emailService');
@@ -502,6 +505,83 @@ class VoiceAutomationService extends EventEmitter {
     this.handleCompleteSpeech(streamSid, ws, audio, { exitsOnly: !!stream.flowId }).catch(err => console.error(err));
   }
 
+  async resolveAgentKnowledge(agent, stream = null) {
+    if (!agent) return '';
+    if (stream?.resolvedKnowledge) return stream.resolvedKnowledge;
+    if (agent._resolvedKnowledge) return agent._resolvedKnowledge;
+
+    try {
+      const parts = [];
+
+      // 1. Direct inline text knowledge base
+      if (agent.custom_knowledge_base && typeof agent.custom_knowledge_base === 'string' && agent.custom_knowledge_base.trim()) {
+        parts.push(agent.custom_knowledge_base.trim());
+      }
+
+      // 2. Attached KnowledgeBase documents
+      let kbDocs = [];
+      if (Array.isArray(agent.knowledge_base) && agent.knowledge_base.length > 0) {
+        const first = agent.knowledge_base[0];
+        if (first && typeof first === 'object' && (first.content !== undefined || first.name || first.file_path)) {
+          kbDocs = agent.knowledge_base;
+        } else {
+          const ids = agent.knowledge_base.filter(id => id && db.mongoose.Types.ObjectId.isValid(String(id)));
+          if (ids.length > 0) {
+            kbDocs = await KnowledgeBase.find({ _id: { $in: ids } }).select('name content type file_path').lean();
+          }
+        }
+      }
+
+      for (const kb of kbDocs) {
+        if (!kb) continue;
+        let content = (kb.content || '').trim();
+
+        // If file_path is set, attempt to read full content from disk if available
+        if (kb.file_path) {
+          try {
+            const relPath = String(kb.file_path).replace(/^\/+/, '');
+            const candidatePaths = [
+              path.isAbsolute(kb.file_path) ? kb.file_path : null,
+              path.join(process.cwd(), relPath),
+              path.join(process.cwd(), 'uploads', relPath.replace(/^uploads\//, '')),
+              path.join('/var/www/autocall-backend/shared', relPath)
+            ].filter(Boolean);
+
+            for (const p of candidatePaths) {
+              if (fs.existsSync(p)) {
+                const stat = fs.statSync(p);
+                if (stat.isFile() && stat.size < 1000000 && /\.(txt|md|csv|json)$/i.test(p)) {
+                  const fileData = fs.readFileSync(p, 'utf8');
+                  if (fileData && fileData.trim().length > content.length) {
+                    content = fileData.trim();
+                  }
+                  break;
+                }
+              }
+            }
+          } catch (readErr) {
+            // Keep DB content on disk read failure
+          }
+        }
+
+        if (content) {
+          parts.push(`## ${kb.name || 'Knowledge Base'}\n${content}`);
+        }
+      }
+
+      const combined = parts.filter(Boolean).join('\n\n');
+      const MAX_KB_CHARS = 25000;
+      const result = combined.length > MAX_KB_CHARS ? combined.slice(0, MAX_KB_CHARS) + '\n[Knowledge truncated]' : combined;
+
+      if (stream) stream.resolvedKnowledge = result;
+      agent._resolvedKnowledge = result;
+      return result;
+    } catch (err) {
+      console.error('[Voice] Error resolving agent knowledge base:', err.message);
+      return agent.custom_knowledge_base || '';
+    }
+  }
+
   greetingText(agent) {
     return agent.first_message || `Hello! I'm ${agent.name}. How can I help you today?`;
   }
@@ -907,12 +987,13 @@ class VoiceAutomationService extends EventEmitter {
               Call.findOne({ twilio_call_sid: callSid }),
               isValidId(userId) ? UserSettings.findOne({ user: userId }).populate('ai_model') : null,
               hasFlow ? Flow.findById(flowId) : null,
-              hasFlow ? Agent.findOne({ flow_id: flowId }).populate('llm_model', 'model_id provider name') : null,
-              hasAgent ? Agent.findById(agentId).populate('llm_model', 'model_id provider name') : null
+              hasFlow ? Agent.findOne({ flow_id: flowId }).populate('llm_model', 'model_id provider name').populate('knowledge_base') : null,
+              hasAgent ? Agent.findById(agentId).populate('llm_model', 'model_id provider name').populate('knowledge_base') : null
             ]);
             const startStream = this.activeStreams.get(streamSid);
             if (startStream) {
-              startStream.agent = hasFlow ? flowAgent : directAgent;
+              const activeAgent = hasFlow ? flowAgent : directAgent;
+              startStream.agent = activeAgent;
               startStream.userSettings = userSettings;
               startStream.aiConfig = userSettings?.ai_model ? {
                 model: userSettings.ai_model.model_id,
@@ -922,6 +1003,9 @@ class VoiceAutomationService extends EventEmitter {
               startStream.callLog = callLog;
               // The answer URL says which way the call goes; the call log is the fallback.
               startStream.greetingWaitMs = this.greetingWaitFor(startStream.agent, customData.direction || callLog?.direction);
+              if (activeAgent) {
+                startStream.resolvedKnowledge = await this.resolveAgentKnowledge(activeAgent, startStream);
+              }
             }
             console.log(`[Timing] Stream setup lookups took ${Date.now() - startedAt}ms`);
 
@@ -1257,9 +1341,9 @@ class VoiceAutomationService extends EventEmitter {
     let currentAgentForChecks = stream.agent || null;
     if (!currentAgentForChecks) {
       if (stream.agentId) {
-        currentAgentForChecks = await Agent.findById(stream.agentId).populate('llm_model', 'model_id provider name');
+        currentAgentForChecks = await Agent.findById(stream.agentId).populate('llm_model', 'model_id provider name').populate('knowledge_base');
       } else if (stream.flowId) {
-        currentAgentForChecks = await Agent.findOne({ flow_id: stream.flowId }).populate('llm_model', 'model_id provider name');
+        currentAgentForChecks = await Agent.findOne({ flow_id: stream.flowId }).populate('llm_model', 'model_id provider name').populate('knowledge_base');
       }
       if (currentAgentForChecks) stream.agent = currentAgentForChecks;
     }
@@ -1537,7 +1621,7 @@ class VoiceAutomationService extends EventEmitter {
           await currentCallLog.save();
         }
       } else if (stream.agentId) {
-        const currentAgent = stream.agent || currentAgentForChecks || (stream.agentId ? await Agent.findById(stream.agentId).populate('llm_model', 'model_id provider name') : null);
+        const currentAgent = stream.agent || currentAgentForChecks || (stream.agentId ? await Agent.findById(stream.agentId).populate('llm_model', 'model_id provider name').populate('knowledge_base') : null);
 
         if (currentAgent) {
           if (!stream.conversationHistory) stream.conversationHistory = [];
@@ -1553,9 +1637,12 @@ class VoiceAutomationService extends EventEmitter {
           const fullPrompt = `Conversation so far:\n${conversationContext}\n\nReply to the user's last message.`;
 
           let systemPrompt = currentAgent.system_prompt || currentAgent.personality || '';
-          if (currentAgent.custom_knowledge_base) {
-            systemPrompt += `\n\nADDITIONAL KNOWLEDGE BASE:\n${currentAgent.custom_knowledge_base}`;
+
+          const kbContent = stream.resolvedKnowledge || await this.resolveAgentKnowledge(currentAgent, stream);
+          if (kbContent) {
+            systemPrompt += `\n\nKNOWLEDGE BASE (BUSINESS DATA, PRODUCTS, PRICES, & POLICIES):\n${kbContent}\n\nKNOWLEDGE BASE INSTRUCTIONS:\n- Answer caller queries accurately using the knowledge base provided above.\n- Provide specific prices, specs, models, offers, and warranty/service terms from the knowledge base.\n- If a specific product or detail requested is not in the knowledge base, do not invent information; tell the caller politely that the team will confirm details on WhatsApp or follow up.\n- Answer in the same language or mix of languages (e.g. English, Kannada, Hindi) the caller speaks in.`;
           }
+
           systemPrompt += `\n\n${CALL_HANDLING_RULES}`;
 
           const turnAbort = new AbortController();

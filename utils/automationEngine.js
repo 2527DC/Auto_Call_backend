@@ -286,8 +286,18 @@ class AutomationEngine {
       const agent = data.agent || {};
 
       let personality = agent.personality || '';
-      if (agent.custom_knowledge_base) {
-        personality += `\n\nADDITIONAL KNOWLEDGE BASE:\n${agent.custom_knowledge_base}`;
+      let kbContent = agent._resolvedKnowledge || '';
+      if (!kbContent && agent.custom_knowledge_base) {
+        kbContent = agent.custom_knowledge_base;
+      }
+      if (!kbContent && Array.isArray(agent.knowledge_base)) {
+        const kbParts = agent.knowledge_base
+          .filter(kb => kb && (kb.content || kb.name))
+          .map(kb => `## ${kb.name || 'Knowledge Base'}\n${kb.content || ''}`);
+        if (kbParts.length > 0) kbContent = kbParts.join('\n\n');
+      }
+      if (kbContent) {
+        personality += `\n\nADDITIONAL KNOWLEDGE BASE:\n${kbContent}`;
       }
 
       const response = await llmService.generateResponse(

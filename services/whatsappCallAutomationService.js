@@ -387,8 +387,17 @@ class WhatsappCallAutomationService {
                 const fullPrompt = `Conversation so far:\n${conversationContext}`;
 
                 let systemPrompt = agent.system_prompt || agent.personality || '';
-                if (agent.custom_knowledge_base) {
-                    systemPrompt += `\n\nADDITIONAL KNOWLEDGE BASE:\n${agent.custom_knowledge_base}`;
+                let kbContent = agent.custom_knowledge_base || '';
+                if (Array.isArray(agent.knowledge_base) && agent.knowledge_base.length > 0) {
+                    const kbParts = agent.knowledge_base
+                        .filter(kb => kb && (kb.content || kb.name))
+                        .map(kb => `## ${kb.name || 'Knowledge Base'}\n${kb.content || ''}`);
+                    if (kbParts.length > 0) {
+                        kbContent = [kbContent, ...kbParts].filter(Boolean).join('\n\n');
+                    }
+                }
+                if (kbContent) {
+                    systemPrompt += `\n\nADDITIONAL KNOWLEDGE BASE:\n${kbContent}`;
                 }
 
                 const aiConfig = userSettings?.ai_model ? {

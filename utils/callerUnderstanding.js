@@ -141,7 +141,15 @@ async function questionFor(node, data) {
   return { question: state.last_question || node.data?.description || node.data?.text, type: 'yes/no or open', options: [], required: true };
 }
 
-const businessInfo = (agent) => [agent?.system_prompt, agent?.custom_knowledge_base].filter(Boolean).join('\n\n');
+const businessInfo = (agent) => {
+  const parts = [agent?.system_prompt, agent?.custom_knowledge_base, agent?._resolvedKnowledge];
+  if (Array.isArray(agent?.knowledge_base)) {
+    for (const kb of agent.knowledge_base) {
+      if (kb && kb.content) parts.push(`## ${kb.name || 'Knowledge Base'}\n${kb.content}`);
+    }
+  }
+  return parts.filter(Boolean).join('\n\n');
+};
 
 class CallerUnderstanding {
   constructor() {

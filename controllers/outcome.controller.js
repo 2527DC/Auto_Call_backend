@@ -151,8 +151,8 @@ exports.setCallOutcome = async (req, res) => {
 
 exports.reanalyzeCall = async (req, res) => {
   try {
-    if (!isId(req.params.id)) return fail(res, 404, 'Call not found');
-    const isAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin';
+    const roleName = req.user?.roleId?.name || (typeof req.user?.roleId === 'string' ? req.user.roleId : null) || req.user?.role;
+    const isAdmin = roleName === 'admin' || roleName === 'super_admin';
     const callQuery = isAdmin ? { _id: req.params.id } : { _id: req.params.id, user_id: ownerOf(req) };
     const call = await Call.findOne(callQuery).select('_id status outcome.state').lean();
     if (!call) return fail(res, 404, 'Call not found');

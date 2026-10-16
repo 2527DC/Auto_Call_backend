@@ -554,18 +554,24 @@ exports.handleRecordingCallback = async (req, res) => {
   }
 };
 
+const isUserAdmin = (user) => {
+  const roleName = user?.roleId?.name || (typeof user?.roleId === 'string' ? user.roleId : null) || user?.role;
+  return roleName === 'admin' || roleName === 'super_admin';
+};
+
 // Filters shared by the Call Activity list and its export.
 const callLogQuery = (req) => {
   const { search = '', status, direction, outcome, reached, sentiment, agent_id, campaign_id, from, to, user_id, client_id } = req.query;
-  const isAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin';
+  const isAdmin = isUserAdmin(req.user);
   const query = {};
 
   if (!isAdmin) {
     query.user_id = req.user.id;
   } else {
     const filterUser = user_id || client_id;
-    if (filterUser && filterUser !== 'all' && db.mongoose.Types.ObjectId.isValid(filterUser)) {
-      query.user_id = filterUser;
+    if (filterUser && filterUser !== 'all') {
+      const isOid = db.mongoose.Types.ObjectId.isValid(filterUser);
+      query.user_id = isOid ? { $in: [filterUser, new db.mongoose.Types.ObjectId(filterUser)] } : filterUser;
     }
   }
 
@@ -653,7 +659,7 @@ const linkNewCaller = (callLog, userId, from) => {
 exports.exportCallLogs = async (req, res) => {
   try {
     const { toCsv, istDateTime } = require('../utils/csv');
-    const isAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin';
+    const isAdmin = isUserAdmin(req.user);
     const calls = await Call.find(callLogQuery(req))
       .sort({ created_at: -1 })
       .limit(10000)
@@ -782,7 +788,7 @@ exports.getCallRecording = async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.id;
-    const isAdmin = req.user?.role === 'admin' || req.user?.role === 'super_admin';
+    const isAdmin = isUserAdmin(req.user);
 
     const call = await Call.findOne(isAdmin ? { _id: id } : { _id: id, user_id: userId });
     if (!call || !call.recording_url) {

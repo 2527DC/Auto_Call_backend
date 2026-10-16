@@ -24,6 +24,7 @@ router.get('/logs', checkPermission('activity.calls'), callController.getCallLog
 router.get('/logs/export', checkPermission('activity.calls'), callController.exportCallLogs);
 router.get('/logs/:id/cost', checkPermission('activity.calls'), callController.getCallCostBreakdown);
 router.get('/:id/cost', checkPermission('activity.calls'), callController.getCallCostBreakdown);
+router.get('/logs/:id/recording', checkPermission('view.calls'), callController.getCallRecording);
 router.get('/:id/recording', checkPermission('view.calls'), callController.getCallRecording);
 
 

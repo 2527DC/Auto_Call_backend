@@ -16,13 +16,29 @@ exports.getAllVoices = async (req, res) => {
   try {
     const filter = req.query.scope === 'all' && isAdmin(req.user) ? {} : { status: 'active' };
     const voices = await Voice.find(filter).sort({ name: 1 });
-    const formattedVoices = voices.map(voice => {
+    let formattedVoices = voices.map(voice => {
       const v = voice.toObject ? voice.toObject() : { ...voice };
       if (!v.preview_url || v.preview_url.startsWith('/api/') || v.preview_url.includes('127.0.0.1') || v.preview_url.includes('localhost') || v.provider === 'sarvam_ai') {
         v.preview_url = `/api/voices/${v.voice_id}/preview`;
       }
       return v;
     });
+
+    const hasSarvam = formattedVoices.some(v => v.provider === 'sarvam_ai');
+    if (!hasSarvam) {
+      try {
+        const sarvamVoices = await sarvamService.fetchVoices();
+        const formattedSarvam = (sarvamVoices || []).map(v => ({
+          ...v,
+          preview_url: `/api/voices/${v.voice_id}/preview`,
+          status: 'active'
+        }));
+        formattedVoices = [...formattedVoices, ...formattedSarvam];
+      } catch (sErr) {
+        console.warn('Could not populate Sarvam fallback voices:', sErr.message);
+      }
+    }
+
     return res.status(200).json({
       success: true,
       data: formattedVoices

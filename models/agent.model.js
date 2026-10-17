@@ -92,6 +92,11 @@ const AgentSchema = new Schema(
       type: String,
       default: null
     },
+    stt_provider: {
+      type: String,
+      enum: ['deepgram', 'sarvam_ai', 'elevenlabs'],
+      default: 'deepgram'
+    },
     voice_provider: {
       type: String,
       enum: ['elevenlabs', 'deepgram', 'sarvam_ai'],

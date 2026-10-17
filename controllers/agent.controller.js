@@ -233,6 +233,10 @@ exports.createAgent = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid telephony provider selected.' });
     }
 
+    if (agentData.stt_provider && !['deepgram', 'sarvam_ai', 'elevenlabs'].includes(agentData.stt_provider)) {
+      return res.status(400).json({ success: false, message: 'Invalid STT (speech-to-text) provider selected.' });
+    }
+
     if (agentData.voice_provider && !['elevenlabs', 'deepgram', 'sarvam_ai'].includes(agentData.voice_provider)) {
       return res.status(400).json({ success: false, message: 'Invalid voice provider selected.' });
     }
@@ -367,6 +371,10 @@ exports.updateAgent = async (req, res) => {
 
     if (updateData.telephony_provider && !['twilio', 'sip', 'meta_whatsapp', 'plivo'].includes(updateData.telephony_provider)) {
       return res.status(400).json({ success: false, message: 'Invalid telephony provider selected.' });
+    }
+
+    if (updateData.stt_provider && !['deepgram', 'sarvam_ai', 'elevenlabs'].includes(updateData.stt_provider)) {
+      return res.status(400).json({ success: false, message: 'Invalid STT (speech-to-text) provider selected.' });
     }
 
     if (updateData.voice_provider && !['elevenlabs', 'deepgram', 'sarvam_ai'].includes(updateData.voice_provider)) {

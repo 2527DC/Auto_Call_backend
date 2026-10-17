@@ -1991,7 +1991,7 @@ class VoiceAutomationService extends EventEmitter {
         }
       }
 
-      const primaryProvider = agent?.voice_provider || (agent?.telephony_provider?.startsWith('deepgram') ? 'deepgram' : (agent?.telephony_provider?.startsWith('sarvam_ai') ? 'sarvam_ai' : 'elevenlabs'));
+      const primaryProvider = agent?.stt_provider || agent?.voice_provider || (agent?.telephony_provider?.startsWith('deepgram') ? 'deepgram' : (agent?.telephony_provider?.startsWith('sarvam_ai') ? 'sarvam_ai' : 'deepgram'));
       const noiseTokens = ['[background noise]', '[pause]', '[laughs]', '[clicking]', '[phone ringing]', '[phone beeping]', '[outro jingle]', '[silence]', '[phone hangs up]', '[phone hanging up]', '[phone clicks]'];
 
       // Primary provider tried first, followed by available fallbacks (deepgram is fastest and most reliable for telephony)
